@@ -110,7 +110,16 @@ esac
 """
 PR_FUNCTIONS = ";".join(
     f"/^{name}()/,/^}}/p"
-    for name in ("wait_for_pr", "reopen_for_ci", "run_annotations", "consider_annotations", "next_question_id")
+    for name in (
+        "wait_for_pr",
+        "reopen_for_ci",
+        "run_annotations",
+        "consider_annotations",
+        "next_question_id",
+        "write_pr_body",
+        "write_pr_body_full",
+        "milestone_title",
+    )
 )
 
 
@@ -192,7 +201,7 @@ class WrapperTest(unittest.TestCase):
         log_dir = self.tmp / "log"
         log_dir.mkdir(exist_ok=True)
         script = f"""set -uo pipefail
-HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
+HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; REPO_ROOT={self.repo}; LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
 PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
 log() {{ echo "LOG: $*"; }}
@@ -424,7 +433,22 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
 
-    # Pull request checks
+    # Pull request body and checks
+
+    def test_pull_request_body_is_cut_to_the_budget(self):
+        long_log = LOG + "".join(f"- 2026-11-02 line {i} " + "x" * 80 + "\n" for i in range(200))
+        self.write_progress(DONE_HEADER + TASK.replace("[ ]", "[x]") + long_log)
+        body = self.tmp / "body.md"
+        result = self.call("write_pr_body", str(body), "4000")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = body.read_text()
+        self.assertLessEqual(len(text), 4000)
+        self.assertTrue(text.startswith("Milestone M1: first\n"))
+        self.assertIn("- T1.1 First", text)
+        self.assertTrue(text.endswith("the whole of it is in tools/autoloop/archive/M1/PROGRESS.md.)\n"))
+        whole = self.call("write_pr_body", str(body))
+        self.assertEqual(whole.returncode, 0, whole.stderr)
+        self.assertIn("line 199", body.read_text())
 
     def test_red_check_on_the_pull_request_is_reported(self):
         self.write_progress(DONE_HEADER + TASK + LOG)

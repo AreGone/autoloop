@@ -60,6 +60,7 @@ readonly MERGE_POLL_S="${MERGE_POLL_S:-600}"
 readonly CHECK_POLL_S="${CHECK_POLL_S:-120}"
 readonly CI_REOPEN_LIMIT="${CI_REOPEN_LIMIT:-3}"
 readonly CI_FIX_ACCEPTANCE="${CI_FIX_ACCEPTANCE:-tools/lint/lint.sh}"
+readonly PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-60000}"
 readonly GIT_REMOTE="${GIT_REMOTE:-origin}"
 readonly BASE_BRANCH="${BASE_BRANCH:-main}"
 readonly PERMISSION_MODE="${PERMISSION_MODE:-acceptEdits}"
@@ -379,10 +380,36 @@ next_milestone() {
 
 #######################################
 # Write the pull request body for the current milestone to the file given: the tasks done and the log.
+# GitHub takes at most 65536 characters in a body, so the log is cut to fit when a budget is given
+# (the archive keeps the whole PROGRESS.md).
+# Arguments:
+#   The output path, then the character budget (optional; no cut when absent).
+#######################################
+write_pr_body() {
+  local milestone budget="${2:-0}"
+  milestone="$(progress_field MILESTONE)"
+  write_pr_body_full "$1"
+  if (( budget > 0 )) && (( $(wc -c < "$1") > budget )); then
+    python3 -I - "$1" "${budget}" "${AUTOLOOP_REL}/archive/${milestone}/PROGRESS.md" <<'PY'
+import pathlib
+import sys
+
+path, budget, archive = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+note = f"\n\n(The log is cut here to fit the pull request; the whole of it is in {archive}.)\n"
+text = path.read_text(encoding="utf-8")
+keep = text[: budget - len(note)]
+keep = keep[: keep.rfind("\n")] if "\n" in keep else keep
+path.write_text(keep + note, encoding="utf-8")
+PY
+  fi
+}
+
+#######################################
+# The whole pull request body: the tasks done and the log, no cut.
 # Arguments:
 #   The output path.
 #######################################
-write_pr_body() {
+write_pr_body_full() {
   local milestone
   milestone="$(progress_field MILESTONE)"
   {
@@ -476,7 +503,7 @@ open_pr() {
   url="$(gh pr view "${branch}" --json url --jq .url 2>/dev/null || true)"
   if [[ -z "${url}" ]]; then
     body="${LOG_DIR}/pr-${milestone}.md"
-    write_pr_body "${body}"
+    write_pr_body "${body}" "${PR_BODY_MAX_CHARS}"
     url="$(gh pr create --base "${BASE_BRANCH}" --head "${branch}" \
       --title "${milestone}: $(milestone_title "${milestone}")" --body-file "${body}" 2>> "${RUN_LOG}")" || { log "gh pr create failed"; return 1; }
   fi
