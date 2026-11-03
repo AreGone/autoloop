@@ -67,6 +67,16 @@ echo x >> "$FAKE_COUNT"
 if [ "$(wc -l < "$FAKE_COUNT")" -eq 2 ]; then git commit -q --allow-empty -m "fake work"; fi
 echo '{"is_error": false, "result": "ok"}'
 """
+# The first call hits the usage limit (the CLI's wording, with a reset the wrapper cannot parse), the second commits.
+FAKE_LIMIT_ONCE = """#!/usr/bin/env bash
+echo x >> "$FAKE_COUNT"
+if [ "$(wc -l < "$FAKE_COUNT")" -eq 1 ]; then
+  echo '{"is_error": true, "result": "You\u2019ve hit your 5-hour limit \u00b7 resets soon"}'
+  exit 1
+fi
+git commit -q --allow-empty -m "fake work"
+echo '{"is_error": false, "result": "ok"}'
+"""
 # The judge answers Q1 as prompts/judge.md asks: Answer line, DECISIONS row, STATUS RUNNING, one commit.
 FAKE_JUDGE_ANSWERS = """#!/usr/bin/env bash
 echo x >> "$FAKE_COUNT"
@@ -328,6 +338,41 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), 3)
         self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: RUNNING"))
+
+    def test_usage_limit_waits_and_is_not_counted_as_no_progress(self):
+        # The first run reports the 5-hour limit: the wrapper sleeps (the default, as the reset is not parsable)
+        # and runs the same stage again; the run is not a strike against NO_PROGRESS_LIMIT.
+        result = self.run_loop(FAKE_LIMIT_ONCE, NO_PROGRESS_LIMIT="1", MAX_ITERATIONS="2", LIMIT_SLEEP_DEFAULT_S="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), 2)
+        self.assertIn("usage limit: sleeping 1s", result.stdout)
+        self.assertNotIn("no commit and no PROGRESS.md change", result.stdout)
+        self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: RUNNING"))
+        self.assertNotIn("\n## Q1 (2026-", self.read("QUESTIONS.md"))
+
+    def test_limit_reset_clock_time_becomes_an_epoch(self):
+        # The classifier reads "resets 5:20pm (UTC)" as the next 17:20 UTC, within the coming 24 h.
+        script = CORE / "kickoff.sh"
+        lines = script.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if "<<'PY'" in line and "out_file" in line) + 1
+        end = next(i for i in range(start, len(lines)) if lines[i] == "PY")
+        out = self.tmp / "limit.json"
+        out.write_text('{"is_error": true, "result": "You\u2019ve hit your 5-hour limit \u00b7 resets 5:20pm (UTC)"}')
+        verdict = subprocess.run(
+            ["python3", "-I", "-", str(out)],
+            input="\n".join(lines[start:end]),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        ).stdout.strip()
+        self.assertRegex(verdict, r"^LIMIT \d{10}$")
+        import datetime as dt
+
+        reset = dt.datetime.fromtimestamp(int(verdict.split()[1]), dt.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
+        self.assertEqual((reset.hour, reset.minute), (17, 20))
+        self.assertTrue(now < reset <= now + dt.timedelta(days=1))
 
     # The judge
 

@@ -284,9 +284,24 @@ low = text.lower()
 # Only an error result is classified; a normal summary may mention limits or authentication as its topic.
 if not is_error:
     print("OK")
-elif re.search(r"(usage limit|hit your limit|rate limit|limit reached|too many requests|overloaded)", low):
+elif re.search(r"(usage limit|hit your \S*\s*limit|rate limit|limit reached|too many requests|overloaded)", low):
+    # The reset time: an epoch after "|" (older wording) or "resets 5:20pm (UTC)" (current wording, a clock
+    # time within the next 24 h). Anything else is 0: the wait falls back to the doubling default.
+    import datetime as dt
+    epoch = "0"
     m = re.search(r"\|(\d{10})", text)
-    print("LIMIT " + (m.group(1) if m else "0"))
+    if m:
+        epoch = m.group(1)
+    else:
+        m = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(utc\)", low)
+        if m:
+            hour = int(m.group(1)) % 12 + (12 if m.group(3) == "pm" else 0)
+            now = dt.datetime.now(dt.timezone.utc)
+            reset = now.replace(hour=hour, minute=int(m.group(2) or 0), second=0, microsecond=0)
+            if reset <= now:
+                reset += dt.timedelta(days=1)
+            epoch = str(int(reset.timestamp()))
+    print("LIMIT " + epoch)
 elif re.search(r"(not logged in|invalid api key|authentication_error|please run /login|run claude login|401 unauthorized)", low):
     print("AUTH")
 else:
