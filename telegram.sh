@@ -16,7 +16,8 @@
 
 set -euo pipefail
 
-readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HERE
 readonly AUTOLOOP_DIR="${AUTOLOOP_DIR:-$(cd "${HERE}/.." && pwd)}"
 readonly REPO_ROOT="${AUTOLOOP_REPO:-$(git -C "${AUTOLOOP_DIR}" rev-parse --show-toplevel)}"
 readonly ENV_FILE="${AUTOLOOP_DIR}/autoloop.env"

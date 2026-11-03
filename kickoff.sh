@@ -24,7 +24,8 @@
 
 set -euo pipefail
 
-readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HERE
 readonly AUTOLOOP_DIR="${AUTOLOOP_DIR:-$(cd "${HERE}/.." && pwd)}"
 readonly REPO_ROOT="${AUTOLOOP_REPO:-$(git -C "${AUTOLOOP_DIR}" rev-parse --show-toplevel)}"
 readonly AUTOLOOP_REL="${AUTOLOOP_DIR#"${REPO_ROOT}"/}"
@@ -249,7 +250,7 @@ invoke() {
   prompt="$(cat "${prompt_file}")"
   # No subagents: they run in the background, and a run that ends its turn to wait for one never hears back.
   local -a cmd=("${CLAUDE_BIN}" -p "${prompt}" --model "${model}" --max-turns "${max_turns}"
-    --disallowedTools Agent,Workflow --output-format json --permission-mode "${PERMISSION_MODE}")
+    --disallowedTools "Agent,Workflow" --output-format json --permission-mode "${PERMISSION_MODE}")
   if (( dry_run )); then
     log "dry-run ${stage}: ${cmd[*]:0:1} -p <${prompt_file}> --model ${model} --max-turns ${max_turns}"
     return 0

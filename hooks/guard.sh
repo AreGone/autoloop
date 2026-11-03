@@ -13,7 +13,8 @@
 
 set -euo pipefail
 
-readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HERE
 readonly RULES="${AUTOLOOP_GUARD_RULES:-${HERE}/../../hooks/rules.sh}"
 
 cmd="$(python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' 2>/dev/null || true)"

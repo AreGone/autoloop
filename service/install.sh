@@ -20,8 +20,10 @@
 
 set -euo pipefail
 
-readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly CORE="$(cd "${HERE}/.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HERE
+CORE="$(cd "${HERE}/.." && pwd)"
+readonly CORE
 readonly AUTOLOOP_DIR="${AUTOLOOP_DIR:-$(cd "${CORE}/.." && pwd)}"
 readonly REPO="${AUTOLOOP_REPO:-$(git -C "${AUTOLOOP_DIR}" rev-parse --show-toplevel)}"
 readonly AUTOLOOP_REL="${AUTOLOOP_DIR#"${REPO}"/}"
