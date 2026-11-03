@@ -7,12 +7,12 @@ Needs git, bash, python3 and the `timeout` binary; claude is a fake script, Tele
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
 
 CORE = Path(__file__).resolve().parents[1]
 CORE_FILES = ("kickoff.sh", "telegram.sh", "qa.py", "ci_task.py")
@@ -40,7 +40,8 @@ BLOCKED_HEADER = HEADER.replace("STATUS: RUNNING", "STATUS: BLOCKED")
 DONE_HEADER = HEADER.replace("STATUS: RUNNING", "STATUS: MILESTONE_DONE")
 LOG = "\n## Log\n\n- 2026-11-01 started.\n  - files: a Log line that looks like a field\n"
 QUESTIONS_HEADER = "# Questions\n\nFormat:\n\n```markdown\n## Q1 (date, task): one line\nContext: ...\nAnswer:\n```\n\n"
-OPEN_Q = "## Q1 (2026-11-01, task T1.1): which port does the API listen on?\nContext: two options.\nProposed: 8080.\nAnswer:\n"
+Q1_TITLE = "Q1 (2026-11-01, task T1.1): which port does the API listen on?"
+OPEN_Q = f"## {Q1_TITLE}\nContext: two options.\nProposed: 8080.\nAnswer:\n"
 PASSED_Q = OPEN_Q.replace("Answer:", "Judge: cannot answer: the owner's call (2026-11-01)\nAnswer:")
 DECISIONS = (
     "# Decisions\n\n## 1. Fixed\n\n| Item | Value |\n|---|---|\n| a | b |\n\n"
@@ -71,8 +72,11 @@ FAKE_JUDGE_ANSWERS = """#!/usr/bin/env bash
 echo x >> "$FAKE_COUNT"
 python3 - <<'PY'
 import pathlib
-q = pathlib.Path("QUESTIONS.md"); q.write_text(q.read_text().replace("Answer:\\n", "Answer: 8080, TECH_STACK.md section 2 (judge, 2026-11-01)\\n"))
-d = pathlib.Path("DECISIONS.md"); d.write_text(d.read_text().replace("\\n## 3. Process", "| Q1 (2026-11-01, task T1.1): which port does the API listen on? | 8080 (judge) |\\n\\n## 3. Process"))
+q = pathlib.Path("QUESTIONS.md")
+q.write_text(q.read_text().replace("Answer:\\n", "Answer: 8080, TECH_STACK.md section 2 (judge, 2026-11-01)\\n"))
+d = pathlib.Path("DECISIONS.md")
+row = "| Q1 (2026-11-01, task T1.1): which port does the API listen on? | 8080 (judge) |\\n\\n## 3. Process"
+d.write_text(d.read_text().replace("\\n## 3. Process", row))
 PY
 if [ -z "$FAKE_FORGET_STATUS" ]; then sed -i '1s/.*/STATUS: RUNNING/' PROGRESS.md; fi
 git add QUESTIONS.md DECISIONS.md PROGRESS.md && git commit -q -m "Judge: answered Q1"
@@ -83,7 +87,8 @@ FAKE_JUDGE_PASSES = """#!/usr/bin/env bash
 echo x >> "$FAKE_COUNT"
 python3 - <<'PY'
 import pathlib
-q = pathlib.Path("QUESTIONS.md"); q.write_text(q.read_text().replace("Answer:\\n", "Judge: cannot answer: the owner's call (2026-11-01)\\nAnswer:\\n"))
+q = pathlib.Path("QUESTIONS.md")
+q.write_text(q.read_text().replace("Answer:\\n", "Judge: cannot answer: the owner's call (2026-11-01)\\nAnswer:\\n"))
 PY
 git add QUESTIONS.md && git commit -q -m "Judge: passed Q1"
 echo '{"is_error": false, "result": "ok"}'
@@ -284,7 +289,9 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         result = self.run_loop(FAKE_APPEND, NO_PROGRESS_LIMIT="2")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.calls(), 5)
-        self.assertIn("4 task runs ended with no commit (PROGRESS.md was changed but never committed)", self.read("QUESTIONS.md"))
+        self.assertIn(
+            "4 task runs ended with no commit (PROGRESS.md was changed but never committed)", self.read("QUESTIONS.md")
+        )
         self.assertEqual(self.read("PROGRESS.md").count("- appended"), 5)
 
     def test_next_question_number_follows_the_last(self):
@@ -328,7 +335,10 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn("(judge, 2026-11-01)", self.read("QUESTIONS.md"))
         self.assertIn("| 8080 (judge) |", self.read("DECISIONS.md"))
         judge_log = (self.loop / "log" / "judge.log").read_text()
-        self.assertRegex(judge_log, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ Q1 answered: 8080, TECH_STACK.md section 2 \(judge, 2026-11-01\)\n$")
+        self.assertRegex(
+            judge_log,
+            r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ Q1 answered: 8080, TECH_STACK.md section 2 \(judge, 2026-11-01\)\n$",
+        )
         self.assertIn("every question answered by the judge; resuming", result.stdout)
         self.assertIn("telegram (not configured): autoloop: judge on M1: Q1 answered: 8080", result.stdout)
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
@@ -379,8 +389,13 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.run_loop(FAKE_JUDGE_ANSWERS, MAX_ITERATIONS="1")
         environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
         result = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status-text"], cwd=self.repo, env=environ,
-            capture_output=True, text=True, timeout=60, check=False,
+            [str(self.loop / "core" / "telegram.sh"), "status-text"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("autoloop M1 | RUNNING | autoloop/M1", result.stdout)
@@ -388,14 +403,24 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertRegex(result.stdout, r"judge:\n\d\d:\d\d Q1 answered: 8080")
         # Sending (not configured: printed) remembers the time; the next report starts there.
         sent = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status"], cwd=self.repo, env=environ,
-            capture_output=True, text=True, timeout=60, check=False,
+            [str(self.loop / "core" / "telegram.sh"), "status"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
         self.assertIn("telegram (not configured): autoloop M1", sent.stdout)
         self.assertTrue((self.loop / "log" / "status.last").read_text().strip().isdigit())
         again = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status-text"], cwd=self.repo, env=environ,
-            capture_output=True, text=True, timeout=60, check=False,
+            [str(self.loop / "core" / "telegram.sh"), "status-text"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
 
@@ -424,14 +449,21 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check gate failed on {sha}", progress)
         self.assertIn("Process completed with exit code 1", progress)
         self.assertIn("##[error]", (self.tmp / "log" / f"ci-M1-{sha}.log").read_text())
-        self.assertEqual(git(self.repo, "log", "-1", "--format=%s"), "Reopen M1: CI red on the pull request, T1.2 makes it green\n")
+        self.assertEqual(
+            git(self.repo, "log", "-1", "--format=%s"), "Reopen M1: CI red on the pull request, T1.2 makes it green\n"
+        )
         self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md"), "")
 
     def test_fix_tasks_are_capped_with_a_question(self):
-        fix = "- [x] T1.2 Make CI green on the pull request: check gate failed on 0000000\n  - notes: tried\n  - verified: ok\n"
+        fix = (
+            "- [x] T1.2 Make CI green on the pull request: check gate failed on 0000000\n"
+            "  - notes: tried\n  - verified: ok\n"
+        )
         self.write_progress(DONE_HEADER + TASK + fix + LOG)
         git(self.repo, "commit", "-q", "-am", "done again")
-        result = self.call("reopen_for_ci", "fail gate https://example.invalid/actions/runs/42/job/7", CI_REOPEN_LIMIT="1")
+        result = self.call(
+            "reopen_for_ci", "fail gate https://example.invalid/actions/runs/42/job/7", CI_REOPEN_LIMIT="1"
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: BLOCKED"))
         questions = self.read("QUESTIONS.md")
@@ -452,8 +484,12 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn("1 warning annotation(s)", last)
         self.assertIn("tools/autoloop/log/ci-annotations-", last)
         self.assertIn("Node.js 20 is deprecated", last)
-        self.assertTrue((self.tmp / "log" / f"ci-annotations-{sha[:7]}.txt").read_text().startswith("warning: .github:2"))
-        self.assertEqual(git(self.repo, "log", "-1", "--format=%s"), f"Reopen M1: 1 CI annotation(s) on {sha[:7]} to consider\n")
+        self.assertTrue(
+            (self.tmp / "log" / f"ci-annotations-{sha[:7]}.txt").read_text().startswith("warning: .github:2")
+        )
+        self.assertEqual(
+            git(self.repo, "log", "-1", "--format=%s"), f"Reopen M1: 1 CI annotation(s) on {sha[:7]} to consider\n"
+        )
         # The same set again in the milestone passes without a change.
         self.write_progress(DONE_HEADER + TASK + LOG)
         git(self.repo, "commit", "-q", "-am", "done again")

@@ -331,7 +331,9 @@ def judged(before_open: str, before_unjudged: str, log_path: pathlib.Path) -> in
     wanted = "BLOCKED" if still_open else "RUNNING"
     if set_status(wanted):
         subprocess.run(["git", "add", "PROGRESS.md"], cwd=REPO, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", f"autoloop: STATUS {wanted} after the judge run"], cwd=REPO, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", f"autoloop: STATUS {wanted} after the judge run"], cwd=REPO, check=True
+        )
         lines.append(f"{stamp} STATUS set to {wanted} by the wrapper")
     if not lines:
         return 1

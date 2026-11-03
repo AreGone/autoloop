@@ -13,6 +13,7 @@ import sys
 
 
 def main() -> None:
+    """Insert the task before the Log section, set STATUS RUNNING and UPDATED, append a Log line."""
     path, milestone, sha, names, pr_url, logfile, acceptance = sys.argv[1:8]
     lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
     major = re.sub(r"\D", "", milestone) or "0"
@@ -23,7 +24,9 @@ def main() -> None:
     log_text = pathlib.Path(logfile).read_text(encoding="utf-8", errors="replace").splitlines()
     links = [raw[2:] for raw in log_text if raw.startswith("# http")]
     errors = [raw.split("##[error]", 1)[1].strip()[:300] for raw in log_text if "##[error]" in raw][:5]
-    error_text = "; ".join(errors) if errors else "no ##[error] line in the log; read it from the start of the failed step"
+    error_text = (
+        "; ".join(errors) if errors else "no ##[error] line in the log; read it from the start of the failed step"
+    )
 
     entry = [
         f"- [ ] {task_id} Make CI green on the pull request: check {names} failed on {sha}",
