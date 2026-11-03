@@ -201,7 +201,8 @@ class WrapperTest(unittest.TestCase):
         log_dir = self.tmp / "log"
         log_dir.mkdir(exist_ok=True)
         script = f"""set -uo pipefail
-HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; REPO_ROOT={self.repo}; LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
+HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; REPO_ROOT={self.repo}
+LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
 PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
 log() {{ echo "LOG: $*"; }}
