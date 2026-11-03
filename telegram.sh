@@ -76,20 +76,23 @@ send_file() {
 #######################################
 status_text() {
   cd "${REPO_ROOT}"
-  local status milestone open prog done_ reopened branch commits since judge
+  local status milestone open prog done_ verifying reopened branch commits since judge
   status="$(sed -n 's/^STATUS: *//p' PROGRESS.md | head -1)"
   milestone="$(sed -n 's/^MILESTONE: *//p' PROGRESS.md | head -1)"
   open="$(grep -cE '^- \[ \] T' PROGRESS.md || true)"
   prog="$(grep -cE '^- \[~\] T' PROGRESS.md || true)"
   done_="$(grep -cE '^- \[x\] T' PROGRESS.md || true)"
   reopened="$(grep -cE '^- \[!\] T' PROGRESS.md || true)"
+  # Done tasks whose verified: field is still empty: the verify run is pending or running on them.
+  verifying="$(awk '/^- \[x\] T/{t=1} /^- \[/{if(!/^- \[x\]/){t=0}} t && /^  - verified: *$/{n++} END{print n+0}' PROGRESS.md)"
   branch="$(git rev-parse --abbrev-ref HEAD)"
   since="$(cat "${STATUS_STAMP}" 2>/dev/null || true)"
   [[ "${since}" =~ ^[0-9]+$ ]] || since=$(( $(date -u +%s) - 3600 ))
   commits="$(git log --since="@${since}" --format='- %s' | head -8)"
   judge="$(python3 -I "${HERE}/qa.py" judge-log --since "${since}" | head -8)"
-  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s\ncommits since the last report:\n%s\njudge:\n%s\n' \
-    "${milestone}" "${status}" "${branch}" "${open}" "${prog}" "${reopened}" "${done_}" "${commits:-- none}" "${judge:-- nothing answered or passed}"
+  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)\ncommits since the last report:\n%s\njudge:\n%s\n' \
+    "${milestone}" "${status}" "${branch}" "${open}" "${prog}" "${reopened}" "${done_}" "${verifying}" \
+    "${commits:-- none}" "${judge:-- nothing answered or passed}"
 }
 
 #######################################

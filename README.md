@@ -124,7 +124,9 @@ the owner; the judge is never asked twice about the same set in one run of
 the wrapper.
 
 The hourly status report (`telegram.sh status`, fired by the
-`<name>-status.timer` unit) carries the milestone, the task counts, the
+`<name>-status.timer` unit) carries the milestone, the task counts (open,
+in progress, reopened, done, and among the done ones how many still await
+their verify run), the
 commits since the last report and the judge's answers and passes since the
 last report; `log/status.last` remembers when the last one went out.
 

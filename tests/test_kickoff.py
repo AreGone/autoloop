@@ -454,6 +454,7 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("autoloop M1 | RUNNING | autoloop/M1", result.stdout)
+        self.assertIn("open 1, in progress 0, reopened 0, done 0 (verifying 0)", result.stdout)
         self.assertIn("commits since the last report:\n- Judge: answered Q1", result.stdout)
         self.assertRegex(result.stdout, r"judge:\n\d\d:\d\d Q1 answered: 8080")
         # Sending (not configured: printed) remembers the time; the next report starts there.
@@ -478,6 +479,26 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
             check=False,
         )
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
+
+    def test_status_report_counts_done_tasks_awaiting_verification(self):
+        # Two done tasks, one verified and one not, and an open one: done 2, verifying 1.
+        verified = (
+            TASK.replace("T1.1 First", "T1.0 Zero").replace("- [ ]", "- [x]").replace("verified:", "verified: abc ok")
+        )
+        unverified = TASK.replace("T1.1 First", "T1.2 Second").replace("- [ ]", "- [x]")
+        self.write_progress(HEADER + verified + unverified + TASK + LOG)
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        result = subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), "status-text"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("open 1, in progress 0, reopened 0, done 2 (verifying 1)", result.stdout)
 
     # Pull request body and checks
 
