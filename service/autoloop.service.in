@@ -1,0 +1,36 @@
+# Autoloop as a system service. Rendered by core/service/install.sh (the @...@ fields),
+# installed as /etc/systemd/system/@NAME@.service. Runs the loop as the user who logged the
+# Claude CLI in, from the repository checkout, with Docker access through that user's group.
+[Unit]
+Description=@NAME@: autonomous development loop (@AUTOLOOP_REL@/kickoff.sh)
+Documentation=file://@AUTOLOOP_DIR@/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+# The Claude CLI keeps its login and sessions under $HOME/.claude; the loop reads autoloop.env itself.
+Environment=HOME=@HOME@
+Environment=PATH=@CLAUDE_DIR@:@NODE_DIR@:@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Volta 2.0.2 runs pnpm only with this flag; it is harmless on a host without Volta.
+Environment=VOLTA_FEATURE_PNPM=1
+ExecStart=@CORE@/kickoff.sh
+# Exit 0 = milestone done or iteration cap: stays stopped until a human sets the next milestone and starts it.
+# Exit 2 = blocked with no answer path, 3 = setup error, 4 = usage cap: a human is needed, so no restart.
+# Anything else (crash, OOM, a killed claude) restarts after ten minutes.
+Restart=on-failure
+RestartPreventExitStatus=2 3 4
+RestartSec=600
+TimeoutStopSec=120
+KillMode=mixed
+# Hardening that does not get in the way of git, docker and the CLI.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=@REPO@ @HOME@
+
+[Install]
+WantedBy=multi-user.target

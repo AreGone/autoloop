@@ -1,0 +1,11 @@
+# One Telegram status message (core/telegram.sh status); fired by @NAME@-status.timer.
+[Unit]
+Description=@NAME@: progress summary to Telegram
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+Environment=HOME=@HOME@
+ExecStart=@CORE@/telegram.sh status

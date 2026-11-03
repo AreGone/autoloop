@@ -1,0 +1,11 @@
+# Every hour, independent of the loop, so the summary arrives even when the loop is stopped.
+[Unit]
+Description=@NAME@: status to Telegram every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
