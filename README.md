@@ -59,7 +59,12 @@ orphan field -> a task field outside a task or repeated within one. Left by the 
                 PROGRESS.md is restored from the commit before it (committed, Telegram) and the stage
                 runs again, up to PROGRESS_REPAIR_LIMIT (2) runs in a row. Found at the start of a
                 pass otherwise (a hand edit, or the limit reached): log, Telegram, exit 3
-telegram.sh status (the hourly timer) reads PROGRESS.md, git log and log/judge.log since the last report
+Dependabot   -> its pull requests on the base branch are looked at before every run and on every poll while
+                a milestone's pull request waits: a green, mergeable one is merged (DEPENDABOT_MERGE: squash
+                by default; report only tells the owner) and the base branch merged into the milestone branch,
+                pushed when the milestone's pull request is open; a red one, one the merge failed on, and a
+                base branch that conflicts are told to the owner once and left; one still being checked waits
+telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, and gh
 ```
 
 ## How a project uses it
@@ -138,9 +143,10 @@ the wrapper.
 The hourly status report (`telegram.sh status`, fired by the
 `<name>-status.timer` unit) carries the milestone, the task counts (open,
 in progress, reopened, done, and among the done ones how many still await
-their verify run), the
-commits since the last report and the judge's answers and passes since the
-last report; `log/status.last` remembers when the last one went out.
+their verify run), the number of open Dependabot pull requests when `gh`
+can list them, the commits since the last report and the judge's answers
+and passes since the last report; `log/status.last` remembers when the last
+one went out.
 
 ## Setting up on a new machine or account
 
@@ -200,7 +206,7 @@ defined.
 
 | File | Role |
 |---|---|
-| `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request |
+| `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request, Dependabot's pull requests |
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
 | `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
@@ -221,6 +227,13 @@ the loop opens it when the milestone is done, watches its checks (a red
 check means the milestone is not done: the loop reopens it with a fix task
 and pushes again; it never asks for a merge while CI is red) and waits for
 the merge, then starts the next milestone by itself; closing the pull
-request unmerged stops the loop. Keep `MILESTONES.md` honest when the plan
+request unmerged stops the loop. Dependabot's pull requests are the loop's
+too: one whose checks are green is merged for you (`DEPENDABOT_MERGE`,
+squash by default; `report` leaves the merge to you, `ignore` leaves them
+all alone) and the base branch is merged into the milestone branch; one
+whose check is red, one the loop could not merge (a required review, a
+forbidden merge method) and a base branch that no longer merges cleanly are
+told to you once and left alone. Keep `MILESTONES.md` honest when the plan
 changes. The loop's prompts do not push; the wrapper pushes the milestone
-branch when the milestone is done.
+branch when the milestone is done, and again when the base branch was
+merged into it while its pull request waits.

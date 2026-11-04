@@ -4,7 +4,9 @@
 # PROGRESS.md as the state the runs share and git commits as checkpoints.
 # A blocked loop first asks the judge run (a strong model) to answer the open
 # questions from the project's documents; what it cannot answer goes to the
-# owner over Telegram.
+# owner over Telegram. Dependabot's pull requests on the base branch are looked
+# at between runs: a green one is merged and brought into the milestone branch,
+# a red one is told to the owner.
 #
 # This file is the shared core (https://github.com/AreGone/autoloop), checked
 # out as a submodule under the project's autoloop directory, by default
@@ -65,6 +67,7 @@ readonly CI_FIX_ACCEPTANCE="${CI_FIX_ACCEPTANCE:-tools/lint/lint.sh}"
 # Run in place of CI when GitHub refuses to start the jobs for billing (bash -c, from the repository root).
 readonly LOCAL_GATE="${LOCAL_GATE:-${CI_FIX_ACCEPTANCE}}"
 readonly LOCAL_GATE_TIMEOUT_S="${LOCAL_GATE_TIMEOUT_S:-7200}"
+readonly DEPENDABOT_MERGE="${DEPENDABOT_MERGE:-squash}"
 readonly PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-60000}"
 readonly GIT_REMOTE="${GIT_REMOTE:-origin}"
 readonly BASE_BRANCH="${BASE_BRANCH:-main}"
@@ -688,6 +691,98 @@ billing_refused() {
 }
 
 #######################################
+# Merge the base branch into the current (milestone) branch after something landed on it, so the
+# runs build against it and the milestone's pull request stays mergeable. The caller pushes when
+# the branch has a pull request. A conflict is the owner's: the merge is aborted and told.
+# Arguments:
+#   What landed on the base branch, for the merge commit's message.
+# Returns:
+#   0 merged or nothing to merge, 1 the fetch or the merge failed.
+#######################################
+merge_base_branch() {
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  git fetch -q "${GIT_REMOTE}" "${BASE_BRANCH}" >> "${RUN_LOG}" 2>&1 || { log "fetch of ${BASE_BRANCH} failed"; return 1; }
+  if git merge-base --is-ancestor "${GIT_REMOTE}/${BASE_BRANCH}" HEAD; then
+    return 0
+  fi
+  if git merge -q --no-edit -m "Merge ${BASE_BRANCH} into ${branch}: $1" "${GIT_REMOTE}/${BASE_BRANCH}" >> "${RUN_LOG}" 2>&1; then
+    log "merged ${BASE_BRANCH} into ${branch} ($1)"
+    return 0
+  fi
+  git merge --abort >> "${RUN_LOG}" 2>&1 || true
+  log "merge of ${BASE_BRANCH} into ${branch} failed after $1; left for the owner"
+  notify "autoloop: ${BASE_BRANCH} does not merge cleanly into ${branch} after $1; merge it by hand before the milestone's pull request."
+  return 1
+}
+
+#######################################
+# Tell the owner about a Dependabot pull request once per head commit and state; the pairs told
+# are kept in log/dependabot-seen.
+# Arguments:
+#   The pull request number, its head sha, the state (red, green, unmerged), the message.
+#######################################
+dependabot_tell() {
+  local seen="${LOG_DIR}/dependabot-seen" key="$1 $2 $3"
+  if ! grep -qxF "${key}" "${seen}" 2>/dev/null; then
+    echo "${key}" >> "${seen}"
+    log "Dependabot #$1 at ${2:0:7} is $3"
+    notify "autoloop: $4"
+  fi
+}
+
+#######################################
+# Look at the open Dependabot pull requests against the base branch. A green, mergeable one is
+# merged with the DEPENDABOT_MERGE method (only while its head is still the commit whose checks
+# were read) and the base branch is then merged into the milestone branch; a red one is told to
+# the owner once per head commit and left alone; one still being checked, one that conflicts
+# (Dependabot rebases it itself) and one with a review asking for changes wait for the next look.
+# DEPENDABOT_MERGE=report tells the owner about a green one instead of merging it; ignore looks
+# at nothing. Never fails the loop; gh missing or failing means nothing to look at.
+#######################################
+check_dependabot_prs() {
+  local -a prs
+  local line number sha mergeable review draft url title checks names
+  [[ "${DEPENDABOT_MERGE}" != "ignore" ]] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  mapfile -t prs < <(gh pr list --app dependabot --state open --base "${BASE_BRANCH}" --limit 50 \
+    --json number,headRefOid,mergeable,reviewDecision,isDraft,url,title \
+    --jq '.[] | [.number, .headRefOid, .mergeable, .reviewDecision, .isDraft, .url, .title] | map(tostring) | join("|")' \
+    2>/dev/null)
+  (( ${#prs[@]} )) || return 0
+  for line in "${prs[@]}"; do
+    IFS='|' read -r number sha mergeable review draft url title <<< "${line}"
+    [[ "${number}" =~ ^[0-9]+$ && "${draft}" != "true" ]] || continue
+    checks="$(gh pr checks "${number}" --json name,bucket,link --jq '.[] | "\(.bucket) \(.name) \(.link)"' 2>/dev/null || true)"
+    names="$(grep -E '^(fail|cancel) ' <<< "${checks}" | awk '{print $2}' | paste -sd, - || true)"
+    if [[ -n "${names}" ]]; then
+      dependabot_tell "${number}" "${sha}" red \
+        "Dependabot pull request #${number} (${title}) is RED: check ${names} failed on ${sha:0:7}; it is left to you. ${url}"
+      continue
+    fi
+    if [[ -z "${checks}" ]] || grep -qE '^pending ' <<< "${checks}"; then
+      continue
+    fi
+    if [[ "${mergeable}" != "MERGEABLE" || "${review}" == "CHANGES_REQUESTED" ]]; then
+      continue
+    fi
+    if [[ "${DEPENDABOT_MERGE}" == "report" ]]; then
+      dependabot_tell "${number}" "${sha}" green \
+        "Dependabot pull request #${number} (${title}) is green and mergeable; DEPENDABOT_MERGE=report, so the merge is yours. ${url}"
+      continue
+    fi
+    if gh pr merge "${number}" "--${DEPENDABOT_MERGE}" --delete-branch --match-head-commit "${sha}" >> "${RUN_LOG}" 2>&1; then
+      log "merged Dependabot #${number} (${title}) into ${BASE_BRANCH}"
+      notify "autoloop: merged Dependabot pull request #${number} (${title}) into ${BASE_BRANCH}: its checks were green. ${url}"
+      merge_base_branch "Dependabot #${number} ${title}" || true
+    else
+      dependabot_tell "${number}" "${sha}" unmerged \
+        "could not merge the green Dependabot pull request #${number} (${title}): gh pr merge failed (a required review, the merge method, or a new commit); see kickoff.log. The merge is yours. ${url}"
+    fi
+  done
+}
+
+#######################################
 # The local stand-in for CI: runs LOCAL_GATE from the repository root, its output saved under log/.
 # Outputs:
 #   The log file.
@@ -713,6 +808,8 @@ run_local_gate() {
 # A pull request without any check is only waited on for the merge. When every failing check is a
 # job GitHub refused to start for billing, CI is not relied on: LOCAL_GATE runs once on that head,
 # green waits for the merge, red is reported as the check "local-gate" whose link is the gate's log.
+# Dependabot's pull requests are looked at on every poll; when a merge of the base branch moved
+# the head, the branch is pushed and its checks are watched from the start again.
 # Outputs:
 #   On a failed check: one line per failing check, "<bucket> <name> <link>".
 # Returns:
@@ -727,6 +824,15 @@ wait_for_pr() {
       MERGED) return 0 ;;
       CLOSED) return 1 ;;
     esac
+    head="$(git rev-parse HEAD)"
+    check_dependabot_prs
+    if [[ "$(git rev-parse HEAD)" != "${head}" ]]; then
+      # The base branch was merged in: the new head is judged afresh on the next pass.
+      head="$(git rev-parse HEAD)"
+      git push -q "${GIT_REMOTE}" "${branch}" >> "${RUN_LOG}" 2>&1 || log "push of ${branch} failed"
+      log "pushed ${branch} at ${head:0:7} with ${BASE_BRANCH} merged in; watching its checks again"
+      continue
+    fi
     pr_head="$(gh pr view "${branch}" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
     head="$(git rev-parse HEAD)"
     if [[ -n "${pr_head}" && "${pr_head}" != "${head}" ]] \
@@ -885,9 +991,10 @@ ensure_branch() {
 }
 
 #######################################
-# The runs that judge (plan, verify, judge) need the strong model: a cheaper alias here is a setup error.
+# The runs that judge (plan, verify, judge) need the strong model: a cheaper alias here is a setup
+# error, as is a DEPENDABOT_MERGE the loop does not know.
 #######################################
-check_models() {
+check_settings() {
   local m
   for m in "${PLAN_MODEL}" "${VERIFY_MODEL}" "${JUDGE_MODEL}"; do
     if [[ ! "${m,,}" =~ (opus|fable) ]]; then
@@ -895,12 +1002,16 @@ check_models() {
       exit 3
     fi
   done
+  case "${DEPENDABOT_MERGE}" in
+    squash|merge|rebase|report|ignore) ;;
+    *) echo "DEPENDABOT_MERGE must be squash, merge, rebase, report or ignore, got '${DEPENDABOT_MERGE}'" >&2; exit 3 ;;
+  esac
 }
 
 main() {
   cd "${REPO_ROOT}"
   [[ -f "${PROGRESS}" ]] || { echo "missing ${PROGRESS}" >&2; exit 3; }
-  check_models
+  check_settings
   if (( print_stage )); then
     next_stage
     exit 0
@@ -914,6 +1025,7 @@ main() {
   local iteration=0 no_progress=0 no_commit=0 no_progress_blocks=0 judge_allowed=1 progress_repairs=0 limit_backoff_s="${LIMIT_SLEEP_DEFAULT_S}"
   local stage head_before progress_before rc=0
   while (( iteration < MAX_ITERATIONS )); do
+    (( dry_run )) || check_dependabot_prs
     stage="$(next_stage)"
     case "${stage}" in
       blocked)

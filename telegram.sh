@@ -78,11 +78,12 @@ send_file() {
 
 #######################################
 # Build the progress summary from PROGRESS.md, git log and the judge log: everything since the
-# last report (at most the last hour when there was none).
+# last report (at most the last hour when there was none), and the open Dependabot pull requests
+# when gh can list them.
 #######################################
 status_text() {
   cd "${REPO_ROOT}"
-  local status milestone open prog done_ verifying reopened branch commits since judge
+  local status milestone open prog done_ verifying reopened branch commits since judge dependabot=""
   status="$(sed -n 's/^STATUS: *//p' PROGRESS.md | head -1)"
   milestone="$(sed -n 's/^MILESTONE: *//p' PROGRESS.md | head -1)"
   open="$(grep -cE '^- \[ \] T' PROGRESS.md || true)"
@@ -97,9 +98,12 @@ status_text() {
   # head stops reading early; the writer's broken pipe must not fail the report under pipefail.
   commits="$(git log --since="@${since}" --format='- %s' 2>/dev/null | head -8 || true)"
   judge="$(python3 -I "${HERE}/qa.py" judge-log --since "${since}" 2>/dev/null | head -8 || true)"
-  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)\ncommits since the last report:\n%s\njudge:\n%s\n' \
+  if command -v gh >/dev/null 2>&1; then
+    dependabot="$(gh pr list --app dependabot --state open --base "${BASE_BRANCH:-main}" --json number --jq length 2>/dev/null || true)"
+  fi
+  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)%s\ncommits since the last report:\n%s\njudge:\n%s\n' \
     "${milestone}" "${status}" "${branch}" "${open}" "${prog}" "${reopened}" "${done_}" "${verifying}" \
-    "${commits:-- none}" "${judge:-- nothing answered or passed}"
+    "${dependabot:+; Dependabot PRs open: ${dependabot}}" "${commits:-- none}" "${judge:-- nothing answered or passed}"
 }
 
 #######################################

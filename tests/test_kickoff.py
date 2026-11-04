@@ -127,8 +127,14 @@ FAKE_GH = """#!/usr/bin/env bash
 # failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
 # commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
 # that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
-# GitHub's billing refusal instead of the warning.
+# GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the
+# status report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
+# in FAKE_MERGED, exits FAKE_MERGE_RC.
 case "$*" in
+  *"pr list --app dependabot"*"--jq length"*) echo "${FAKE_PRS_COUNT:-0}" ;;
+  *"pr list --app dependabot"*) printf '%s' "${FAKE_PRS:-}" ;;
+  *"pr checks 12 "*) printf '%s\\n' "${FAKE_PR_CHECKS-pass gate https://example.invalid/actions/runs/43/job/8}" ;;
+  *"pr merge 12 "*) echo "$*" >> "${FAKE_MERGED:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}" ;;
   *"pr view"*"state"*) echo OPEN ;;
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
   *"pr view"*"url"*) echo "https://example.invalid/pr/1" ;;
@@ -152,10 +158,16 @@ case "$*" in
   *) exit 1 ;;
 esac
 """
+DEPENDABOT_SHA = "a" * 40
+# One open Dependabot pull request, #12, as the scripted gh lists it.
+DEPENDABOT_PR = f"12|{DEPENDABOT_SHA}|MERGEABLE||false|https://example.invalid/pr/12|Bump x from 1 to 2\n"
 PR_FUNCTIONS = ";".join(
     f"/^{name}()/,/^}}/p"
     for name in (
         "wait_for_pr",
+        "check_dependabot_prs",
+        "dependabot_tell",
+        "merge_base_branch",
         "reopen_for_ci",
         "run_annotations",
         "billing_refused",
@@ -203,6 +215,32 @@ class WrapperTest(unittest.TestCase):
         git(self.repo, "init", "-q", "-b", "autoloop/M1")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-q", "-m", "initial")
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").chmod(0o755)
+        self.merged = self.tmp / "merged"
+
+    def add_remote(self) -> Path:
+        """Gives the repository a bare origin holding main, at the initial commit, and the milestone branch."""
+        remote = self.tmp / "remote.git"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(remote))
+        git(self.repo, "remote", "add", "origin", str(remote))
+        git(self.repo, "branch", "main")
+        git(self.repo, "push", "-q", "origin", "main", "autoloop/M1")
+        return remote
+
+    def land_on_main(self, name: str, content: str) -> str:
+        """Commits a file on origin's main, as a merged Dependabot pull request would; returns the sha."""
+        work = self.tmp / "work"
+        git(self.tmp, "clone", "-q", "-b", "main", str(self.tmp / "remote.git"), str(work))
+        (work / name).write_text(content)
+        git(work, "add", name)
+        git(work, "commit", "-q", "-m", f"Bump x from 1 to 2 ({name})")
+        git(work, "push", "-q", "origin", "main")
+        sha = git(work, "rev-parse", "HEAD").strip()
+        shutil.rmtree(work)
+        return sha
 
     def write_progress(self, text: str) -> None:
         (self.repo / "PROGRESS.md").write_text(text)
@@ -218,6 +256,7 @@ class WrapperTest(unittest.TestCase):
         environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
         environ.update(IDENTITY)
         environ.update({"FAKE_FORGET_STATUS": "", **env}, CLAUDE_BIN=str(claude), FAKE_COUNT=str(self.tmp / "count"))
+        environ.update(PATH=f"{self.bin}:{environ['PATH']}", FAKE_MERGED=str(self.merged))
         return subprocess.run(
             [str(self.loop / "core" / "kickoff.sh"), *args],
             cwd=self.repo,
@@ -233,6 +272,20 @@ class WrapperTest(unittest.TestCase):
         count = self.tmp / "count"
         return len(count.read_text().splitlines()) if count.exists() else 0
 
+    def telegram(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        """Runs telegram.sh with the fake gh on the PATH and Telegram not configured."""
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        environ.update(env, PATH=f"{self.bin}:{environ['PATH']}")
+        return subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), *args],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
     def stage(self, progress: str) -> str:
         """The stage kickoff.sh prints for the given PROGRESS.md text."""
         self.write_progress(progress)
@@ -242,10 +295,6 @@ class WrapperTest(unittest.TestCase):
 
     def call(self, function: str, *args: str, timeout: int = 20, **env: str) -> subprocess.CompletedProcess:
         """Runs one pull-request function of kickoff.sh with the fake gh on the PATH, log and notify stubbed."""
-        bin_dir = self.tmp / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        (bin_dir / "gh").write_text(FAKE_GH)
-        (bin_dir / "gh").chmod(0o755)
         log_dir = self.tmp / "log"
         log_dir.mkdir(exist_ok=True)
         script = f"""set -uo pipefail
@@ -254,13 +303,15 @@ LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
 PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
 LOCAL_GATE="${{LOCAL_GATE:-true}}"; LOCAL_GATE_TIMEOUT_S=60
+GIT_REMOTE=origin; BASE_BRANCH=main; DEPENDABOT_MERGE=${{DEPENDABOT_MERGE:-squash}}
 log() {{ echo "LOG: $*"; }}
 notify() {{ echo "NOTIFY: $*"; }}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
 source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
 {function} "$@"
 """
-        environ = {**os.environ, **IDENTITY, **env, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        environ = {**os.environ, **IDENTITY, "FAKE_MERGED": str(self.merged), **env}
+        environ["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         return subprocess.run(
             ["timeout", str(timeout), "bash", "-c", script, "bash", *args],
             cwd=self.repo,
@@ -422,6 +473,12 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
             result = self.run_loop(FAKE_COMMIT, **{var: "sonnet"})
             self.assertEqual(result.returncode, 3, var)
             self.assertIn("Fable or Opus", result.stderr)
+        self.assertEqual(self.calls(), 0)
+
+    def test_unknown_dependabot_setting_is_a_setup_error(self):
+        result = self.run_loop(FAKE_COMMIT, DEPENDABOT_MERGE="auto")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("DEPENDABOT_MERGE must be squash, merge, rebase, report or ignore, got 'auto'", result.stderr)
         self.assertEqual(self.calls(), 0)
 
     def test_task_model_line_picks_the_model(self):
@@ -664,42 +721,17 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
     def test_status_report_carries_the_judge_lines(self):
         self.block_with_question()
         self.run_loop(FAKE_JUDGE_ANSWERS, MAX_ITERATIONS="1")
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
-        result = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status-text"],
-            cwd=self.repo,
-            env=environ,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        result = self.telegram("status-text")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("autoloop M1 | RUNNING | autoloop/M1", result.stdout)
         self.assertIn("open 1, in progress 0, reopened 0, done 0 (verifying 0)", result.stdout)
         self.assertIn("commits since the last report:\n- Judge: answered Q1", result.stdout)
         self.assertRegex(result.stdout, r"judge:\n\d\d:\d\d Q1 answered: 8080")
         # Sending (not configured: printed) remembers the time; the next report starts there.
-        sent = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status"],
-            cwd=self.repo,
-            env=environ,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        sent = self.telegram("status")
         self.assertIn("telegram (not configured): autoloop M1", sent.stdout)
         self.assertTrue((self.loop / "log" / "status.last").read_text().strip().isdigit())
-        again = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status-text"],
-            cwd=self.repo,
-            env=environ,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        again = self.telegram("status-text")
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
 
     def test_status_report_survives_a_long_backlog_and_is_cut_to_the_limit(self):
@@ -745,18 +777,14 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         unverified = TASK.replace("T1.1 First", "T1.2 Second").replace("- [ ]", "- [x]")
         self.write_progress(HEADER + verified + unverified + TASK + LOG)
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
-        result = subprocess.run(
-            [str(self.loop / "core" / "telegram.sh"), "status-text"],
-            cwd=self.repo,
-            env=environ,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        result = self.telegram("status-text")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("open 1, in progress 0, reopened 0, done 2 (verifying 1)", result.stdout)
+
+    def test_status_report_counts_the_open_dependabot_pull_requests(self):
+        result = self.telegram("status-text", FAKE_PRS_COUNT="2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("done 0 (verifying 0); Dependabot PRs open: 2\n", result.stdout)
 
     # Pull request body and checks
 
@@ -962,6 +990,161 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         again = self.call("consider_annotations", "the pull request", "42")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: MILESTONE_DONE"))
+
+    # Dependabot's pull requests
+
+    def merges(self) -> list[str]:
+        """The gh pr merge calls the scripted gh recorded."""
+        return self.merged.read_text().splitlines() if self.merged.exists() else []
+
+    def test_green_dependabot_pull_request_is_merged_and_the_base_brought_in(self):
+        self.add_remote()
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "branch work")
+        landed = self.land_on_main("lock.txt", "2\n")
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.merges(), [f"pr merge 12 --squash --delete-branch --match-head-commit {DEPENDABOT_SHA}"]
+        )
+        self.assertIn(
+            "NOTIFY: autoloop: merged Dependabot pull request #12 (Bump x from 1 to 2) into main: its checks were "
+            "green. https://example.invalid/pr/12",
+            result.stdout,
+        )
+        self.assertIn("LOG: merged main into autoloop/M1 (Dependabot #12 Bump x from 1 to 2)", result.stdout)
+        self.assertEqual(
+            git(self.repo, "log", "-1", "--format=%s"),
+            "Merge main into autoloop/M1: Dependabot #12 Bump x from 1 to 2\n",
+        )
+        self.assertIn(landed, git(self.repo, "log", "--format=%H"))
+        self.assertEqual(self.read("lock.txt"), "2\n")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        # Nothing new on main: the next look merges nothing into the branch.
+        again = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("LOG: merged main", again.stdout)
+
+    def test_red_dependabot_pull_request_is_told_once_and_left(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        checks = "fail gate https://example.invalid/actions/runs/43/job/8"
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_PR_CHECKS=checks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is RED: check gate failed on aaaaaaa; "
+            "it is left to you. https://example.invalid/pr/12",
+            result.stdout,
+        )
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        again = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_PR_CHECKS=checks)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("NOTIFY", again.stdout)
+        self.assertEqual((self.tmp / "log" / "dependabot-seen").read_text(), f"12 {DEPENDABOT_SHA} red\n")
+        # A new head of the same pull request is looked at afresh.
+        moved = DEPENDABOT_PR.replace(DEPENDABOT_SHA, "b" * 40)
+        third = self.call("check_dependabot_prs", FAKE_PRS=moved, FAKE_PR_CHECKS=checks)
+        self.assertIn("is RED: check gate failed on bbbbbbb", third.stdout)
+
+    def test_dependabot_pull_request_not_ready_waits_for_the_next_look(self):
+        pending = "pending gate https://example.invalid/actions/runs/43/job/8"
+        for prs, checks in (
+            (DEPENDABOT_PR, pending),
+            (DEPENDABOT_PR, ""),
+            (DEPENDABOT_PR.replace("MERGEABLE", "CONFLICTING"), None),
+            (DEPENDABOT_PR.replace("MERGEABLE||", "MERGEABLE|CHANGES_REQUESTED|"), None),
+            (DEPENDABOT_PR.replace("|false|", "|true|"), None),
+        ):
+            env = {"FAKE_PRS": prs}
+            if checks is not None:
+                env["FAKE_PR_CHECKS"] = checks
+            result = self.call("check_dependabot_prs", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "", prs)
+        self.assertEqual(self.merges(), [])
+        self.assertFalse((self.tmp / "log" / "dependabot-seen").exists())
+
+    def test_report_mode_tells_about_a_green_dependabot_pull_request_once(self):
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, DEPENDABOT_MERGE="report")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is green and mergeable; "
+            "DEPENDABOT_MERGE=report, so the merge is yours.",
+            result.stdout,
+        )
+        self.assertEqual(self.merges(), [])
+        again = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, DEPENDABOT_MERGE="report")
+        self.assertNotIn("NOTIFY", again.stdout)
+        ignored = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, DEPENDABOT_MERGE="ignore")
+        self.assertEqual(ignored.stdout, "")
+
+    def test_failed_dependabot_merge_is_told_once(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_MERGE_RC="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "NOTIFY: autoloop: could not merge the green Dependabot pull request #12 (Bump x from 1 to 2): gh pr merge "
+            "failed",
+            result.stdout,
+        )
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        again = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_MERGE_RC="1")
+        self.assertNotIn("NOTIFY", again.stdout)
+
+    def test_base_branch_that_conflicts_is_left_to_the_owner(self):
+        self.add_remote()
+        self.land_on_main("HISTORY.md", "# History\n- main's line\n")
+        (self.repo / "HISTORY.md").write_text("# History\n- the branch's line\n")
+        git(self.repo, "commit", "-q", "-am", "branch history")
+        head = git(self.repo, "rev-parse", "HEAD")
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOTIFY: autoloop: merged Dependabot pull request #12", result.stdout)
+        self.assertIn(
+            "NOTIFY: autoloop: main does not merge cleanly into autoloop/M1 after Dependabot #12 Bump x from 1 to 2; "
+            "merge it by hand before the milestone's pull request.",
+            result.stdout,
+        )
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+        self.assertEqual(self.read("HISTORY.md"), "# History\n- the branch's line\n")
+
+    def test_waiting_pull_request_is_pushed_after_a_dependabot_merge(self):
+        remote = self.add_remote()
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        git(self.repo, "commit", "-q", "-am", "done")
+        git(self.repo, "push", "-q", "origin", "autoloop/M1")
+        old_head = git(self.repo, "rev-parse", "HEAD").strip()
+        self.land_on_main("lock.txt", "2\n")
+        # The pull request's head stays the old commit for gh, so no check is ever read: the wait times out.
+        result = self.call("wait_for_pr", timeout=4, FAKE_HEAD=old_head, FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        new_head = git(self.repo, "rev-parse", "HEAD").strip()
+        self.assertNotEqual(new_head, old_head)
+        self.assertIn(
+            f"LOG: pushed autoloop/M1 at {new_head[:7]} with main merged in; watching its checks again", result.stdout
+        )
+        self.assertEqual(git(remote, "rev-parse", "autoloop/M1").strip(), new_head)
+        self.assertEqual(result.stdout.count("LOG: pushed"), 1)
+
+    def test_loop_looks_at_dependabot_before_each_run_but_not_in_a_dry_run(self):
+        self.add_remote()
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "branch work")
+        self.land_on_main("lock.txt", "2\n")
+        dry = self.run_loop(FAKE_COMMIT, "--dry-run", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self.merges(), [])
+        self.assertFalse((self.repo / "lock.txt").exists())
+        result = self.run_loop(FAKE_COMMIT, "--once", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertIn("merged Dependabot #12 (Bump x from 1 to 2) into main", result.stdout)
+        self.assertIn("telegram (not configured): autoloop: merged Dependabot pull request #12", result.stdout)
+        self.assertEqual(self.read("lock.txt"), "2\n")
+        subjects = git(self.repo, "log", "--format=%s").splitlines()
+        self.assertEqual(subjects[:2], ["fake work", "Merge main into autoloop/M1: Dependabot #12 Bump x from 1 to 2"])
+        self.assertEqual(self.calls(), 1)
 
 
 if __name__ == "__main__":
