@@ -92,6 +92,12 @@ if [ -z "$FAKE_FORGET_STATUS" ]; then sed -i '1s/.*/STATUS: RUNNING/' PROGRESS.m
 git add QUESTIONS.md DECISIONS.md PROGRESS.md && git commit -q -m "Judge: answered Q1"
 echo '{"is_error": false, "result": "ok"}'
 """
+# The judge answers with an option letter first and its "(judge, <date>)" mark last: the line begins
+# and ends with a bracket, which must not read as a placeholder such as "(human)".
+FAKE_JUDGE_ANSWERS_OPTION = FAKE_JUDGE_ANSWERS.replace(
+    "Answer: 8080, TECH_STACK.md section 2 (judge, 2026-11-01)",
+    "Answer: (a). TECH_STACK.md section 2 (judge, 2026-11-01)",
+)
 # The judge passes Q1 to the owner.
 FAKE_JUDGE_PASSES = """#!/usr/bin/env bash
 echo x >> "$FAKE_COUNT"
@@ -397,6 +403,41 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn("every question answered by the judge; resuming", result.stdout)
         self.assertIn("telegram (not configured): autoloop: judge on M1: Q1 answered: 8080", result.stdout)
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_judge_answer_in_brackets_is_an_answer(self):
+        self.block_with_question()
+        result = self.run_loop(FAKE_JUDGE_ANSWERS_OPTION, MAX_ITERATIONS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: RUNNING"))
+        self.assertIn("Q1 answered: (a). TECH_STACK.md section 2 (judge, 2026-11-01)", result.stdout)
+        self.assertEqual(self.qa("list", "--ids").stdout.strip(), "")
+
+    def test_placeholder_answers_stay_open(self):
+        for placeholder in ("", "(human)", "[owner]", "(tbd)", "---", "pending", "?"):
+            with self.subTest(placeholder=placeholder):
+                (self.repo / "QUESTIONS.md").write_text(
+                    QUESTIONS_HEADER + OPEN_Q.replace("Answer:", f"Answer: {placeholder}")
+                )
+                self.assertEqual(self.qa("list", "--ids").stdout.strip(), "1")
+        for answer in ("(a)", "(2)", "(a) (telegram, 2026-11-01)", "8080 (telegram, 2026-11-01)"):
+            with self.subTest(answer=answer):
+                (self.repo / "QUESTIONS.md").write_text(
+                    QUESTIONS_HEADER + OPEN_Q.replace("Answer:", f"Answer: {answer}")
+                )
+                self.assertEqual(self.qa("list", "--ids").stdout.strip(), "")
+
+    def qa(self, *args: str) -> subprocess.CompletedProcess:
+        """Runs qa.py in the repository without Telegram configured."""
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        return subprocess.run(
+            ["python3", "-I", str(self.loop / "core" / "qa.py"), *args],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
 
     def test_judge_forgot_status_and_the_wrapper_reconciles(self):
         self.block_with_question()

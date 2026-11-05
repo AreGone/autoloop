@@ -50,9 +50,13 @@ LOG_DIR = AUTOLOOP_DIR / "log"
 OFFSET_FILE = LOG_DIR / "telegram.offset"
 JUDGE_LOG = LOG_DIR / "judge.log"
 ANSWER_RE = re.compile(r"^\s*Q[-_ ]?(\d+)\s*[:\-]?\s*(.+)$", re.DOTALL | re.IGNORECASE)
-# What counts as "no answer yet" on an Answer: line: empty, a bracketed placeholder such as "(human)",
-# dashes, or the words tbd / todo / pending / open.
-PLACEHOLDER_RE = re.compile(r"^(\(.*\)|\[.*\]|-+|tbd|todo|pending|open|\?+)?$", re.IGNORECASE)
+# What counts as "no answer yet" on an Answer: line: empty, one bracketed placeholder such as "(human)"
+# or "[owner]", dashes, or the words tbd / todo / pending / open. One bracket pair only, so an answer
+# that starts with an option such as "(a)" and ends with "(judge, <date>)" is an answer; and a bracketed
+# option letter or number alone, "(a)" or "(2)", is an answer too.
+PLACEHOLDER_RE = re.compile(
+    r"^(\((?![a-z0-9]\))[^()]*\)|\[(?![a-z0-9]\])[^\[\]]*\]|-+|tbd|todo|pending|open|\?+)?$", re.IGNORECASE
+)
 POLL_S = 30
 FIELD_RE = re.compile(r"^(context|proposed|answer|judge|options?|cost|impact)\s*:", re.IGNORECASE)
 
