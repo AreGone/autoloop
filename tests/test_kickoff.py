@@ -426,6 +426,26 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
                 )
                 self.assertEqual(self.qa("list", "--ids").stdout.strip(), "")
 
+    def test_answer_to_a_reused_id_goes_to_the_open_question(self):
+        """A run reused Q1 for a second question; the owner's reply lands on the open one, not the judged one."""
+        judged = OPEN_Q.replace("Answer:", "Answer: 8080, TECH_STACK.md section 2 (judge, 2026-11-01)")
+        second = "## Q1 (2026-11-02, task T1.2): which port does the broker listen on?\nContext: one option.\nAnswer:\n"
+        self.block_with_question(judged + "\n" + second)
+        answers = self.tmp / "answers.txt"
+        answers.write_text("Q1 1883\n")
+        self.qa("wait", "--from-file", str(answers))
+        questions = self.read("QUESTIONS.md")
+        self.assertIn("Answer: 8080, TECH_STACK.md section 2 (judge, 2026-11-01)\n", questions)
+        self.assertRegex(
+            questions, r"broker listen on\?\nContext: one option\.\nAnswer: 1883 \(file, \d{4}-\d\d-\d\d\)\n"
+        )
+        self.assertIn(
+            "| Q1 (2026-11-02, task T1.2): which port does the broker listen on? | 1883 |\n", self.read("DECISIONS.md")
+        )
+        self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: RUNNING"))
+        self.assertEqual(self.qa("list", "--ids").stdout.strip(), "")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
     def qa(self, *args: str) -> subprocess.CompletedProcess:
         """Runs qa.py in the repository without Telegram configured."""
         environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}

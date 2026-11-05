@@ -16,6 +16,7 @@ An answer is a Telegram message from the configured chat that starts with the qu
 Recording an answer: the question's "Answer:" line in QUESTIONS.md, a row in DECISIONS.md section 2
 (so the next run reads it where every run looks), and when no question is left open,
 "STATUS: RUNNING" in PROGRESS.md; the three files are committed. Only messages from TELEGRAM_CHAT_ID count.
+When two questions carry one id (a run reused a number), the answer goes to the one still open.
 The judge run (prompts/judge.md) records its answers in the same two places itself, with "(judge, <date>)"
 on the Answer: line, and marks a question it passes to the owner with a "Judge: cannot answer: ..." line.
 Settings come from <project autoloop dir>/autoloop.env; without a token "send" prints and "wait" exits 2.
@@ -213,8 +214,9 @@ def set_status(status: str) -> bool:
 
 def record(qid: str, answer: str, source: str) -> None:
     """Write the answer into QUESTIONS.md and DECISIONS.md; set RUNNING when nothing stays open; commit."""
-    questions = parse_questions()
-    target = next((q for q in questions if q.qid == qid), None)
+    # A run may reuse a number already in the file; the reply then belongs to the question still open.
+    same_id = [q for q in parse_questions() if q.qid == qid]
+    target = next((q for q in same_id if not q.answered), same_id[0] if same_id else None)
     if target is None:
         raise KeyError(qid)
     lines = QUESTIONS.read_text().splitlines()

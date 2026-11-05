@@ -94,7 +94,8 @@ pointer (`git add tools/autoloop/core`) like any file.
 What the project must provide: `PROGRESS.md` with the `STATUS`, `MILESTONE`
 and `UPDATED` header lines and the task format the prompts describe;
 `MILESTONES.md` with one `## M<n>: title` heading per milestone;
-`QUESTIONS.md` with `## Q<n>` sections that end in an `Answer:` line;
+`QUESTIONS.md` with `## Q<n>` sections that end in an `Answer:` line, each
+id one above the highest in the file and never reused;
 `DECISIONS.md` with a `## 3. Process` heading, before which answers are
 recorded as table rows; `HISTORY.md`; a `CLAUDE.md` the runs start from; a
 lint gate the task prompt names; `gh` logged in for pull requests.
