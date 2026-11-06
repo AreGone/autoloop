@@ -52,6 +52,8 @@ readonly STAGE_TIMEOUT_S="${STAGE_TIMEOUT_S:-5400}"
 readonly MAX_ITERATIONS="${MAX_ITERATIONS:-200}"
 readonly NO_PROGRESS_LIMIT="${NO_PROGRESS_LIMIT:-3}"
 readonly NO_COMMIT_LIMIT="${NO_COMMIT_LIMIT:-$(( NO_PROGRESS_LIMIT * 2 ))}"
+# Runs in a row that may break PROGRESS.md (a task field outside a task) and have it restored and retried.
+readonly PROGRESS_REPAIR_LIMIT="${PROGRESS_REPAIR_LIMIT:-2}"
 readonly LIMIT_SLEEP_DEFAULT_S="${LIMIT_SLEEP_DEFAULT_S:-1800}"
 readonly LIMIT_SLEEP_MAX_S="${LIMIT_SLEEP_MAX_S:-10800}"
 readonly LIMIT_NOTIFY_HOURS="${LIMIT_NOTIFY_HOURS:-6}"
@@ -163,6 +165,28 @@ orphan_field() {
       seen[name] = 1
     }
   ' "${PROGRESS}"
+}
+
+#######################################
+# Undo a run's damage to PROGRESS.md: put back the version of the commit before the run and commit it,
+# so the same stage runs again. The run's other commits (code, tests) stay; history is not rewritten.
+# Arguments:
+#   The stage that ran, the commit before it.
+# Returns:
+#   0 when PROGRESS.md was restored, 1 when it could not be.
+#######################################
+repair_progress() {
+  local stage="$1" before="$2" found
+  found="$(orphan_field)"
+  git show "${before}:PROGRESS.md" > "${PROGRESS}.restore" 2>/dev/null || { rm -f "${PROGRESS}.restore"; return 1; }
+  mv "${PROGRESS}.restore" "${PROGRESS}"
+  if ! git diff --quiet -- PROGRESS.md; then
+    git add PROGRESS.md \
+      && git commit -q -m "autoloop: restore PROGRESS.md, the ${stage} run left a task field outside a task" \
+      || return 1
+  fi
+  log "the ${stage} run left a task field outside a task (${found}); PROGRESS.md restored from ${before:0:7}, ${stage} runs again"
+  notify "autoloop: the ${stage} run broke PROGRESS.md (line ${found}); restored it and running ${stage} again."
 }
 
 #######################################
@@ -749,7 +773,7 @@ main() {
   fi
   ensure_branch
 
-  local iteration=0 no_progress=0 no_commit=0 no_progress_blocks=0 judge_allowed=1 limit_backoff_s="${LIMIT_SLEEP_DEFAULT_S}"
+  local iteration=0 no_progress=0 no_commit=0 no_progress_blocks=0 judge_allowed=1 progress_repairs=0 limit_backoff_s="${LIMIT_SLEEP_DEFAULT_S}"
   local stage head_before progress_before rc=0
   while (( iteration < MAX_ITERATIONS )); do
     stage="$(next_stage)"
@@ -839,6 +863,18 @@ main() {
       continue   # same stage again
     fi
     limit_backoff_s="${LIMIT_SLEEP_DEFAULT_S}"
+
+    # A run that left a task field outside a task (it overwrote a task heading) is undone and retried;
+    # after PROGRESS_REPAIR_LIMIT such runs in a row the damage stays and the next pass stops (bad_progress).
+    if [[ -n "$(orphan_field)" ]]; then
+      if (( progress_repairs < PROGRESS_REPAIR_LIMIT )) && repair_progress "${stage}" "${head_before}"; then
+        progress_repairs=$(( progress_repairs + 1 ))
+        (( dry_run || once )) && exit 0
+        continue
+      fi
+    else
+      progress_repairs=0
+    fi
 
     if (( dry_run || once )); then
       log "stopping after one stage (--once/--dry-run)"

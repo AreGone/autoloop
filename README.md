@@ -47,7 +47,10 @@ usage limit  -> sleep until reset (or default, doubling); exit 4 when longer tha
 no progress  -> after NO_PROGRESS_LIMIT runs without a commit: STATUS BLOCKED with a question that names
                 the last result file; the judge reads it first, then the owner; the second such block
                 in one run goes to the owner directly
-orphan field -> a task field outside a task or repeated within one: log, Telegram, exit 3
+orphan field -> a task field outside a task or repeated within one. Left by the run that just ended:
+                PROGRESS.md is restored from the commit before it (committed, Telegram) and the stage
+                runs again, up to PROGRESS_REPAIR_LIMIT (2) runs in a row. Found at the start of a
+                pass otherwise (a hand edit, or the limit reached): log, Telegram, exit 3
 telegram.sh status (the hourly timer) reads PROGRESS.md, git log and log/judge.log since the last report
 ```
 

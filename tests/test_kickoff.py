@@ -67,6 +67,19 @@ echo x >> "$FAKE_COUNT"
 if [ "$(wc -l < "$FAKE_COUNT")" -eq 2 ]; then git commit -q --allow-empty -m "fake work"; fi
 echo '{"is_error": false, "result": "ok"}'
 """
+# A run that overwrites the task heading (as an edit of the task above it can) and commits PROGRESS.md.
+FAKE_BREAK_ALWAYS = """#!/usr/bin/env bash
+echo x >> "$FAKE_COUNT"
+sed -i '/^- \\[.\\] T1.1 First$/d' PROGRESS.md
+git commit -q -am "broke the heading"
+echo '{"is_error": false, "result": "ok"}'
+"""
+FAKE_BREAK_FIRST = """#!/usr/bin/env bash
+echo x >> "$FAKE_COUNT"
+if [ "$(wc -l < "$FAKE_COUNT")" -eq 1 ]; then sed -i '/^- \\[.\\] T1.1 First$/d' PROGRESS.md; fi
+git commit -q --allow-empty -am "work"
+echo '{"is_error": false, "result": "ok"}'
+"""
 # The first call hits the usage limit (the CLI's wording, with a reset the wrapper cannot parse), the second commits.
 FAKE_LIMIT_ONCE = """#!/usr/bin/env bash
 echo x >> "$FAKE_COUNT"
@@ -276,6 +289,29 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         result = self.run_loop(FAKE_COMMIT)
         self.assertEqual(result.returncode, 3)
         self.assertEqual(self.calls(), 0)
+
+    def test_run_that_breaks_progress_is_restored_and_retried(self):
+        result = self.run_loop(FAKE_BREAK_FIRST, MAX_ITERATIONS="2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), 2)
+        self.assertIn("- [ ] T1.1 First\n", self.read("PROGRESS.md"))
+        self.assertIn("autoloop: restore PROGRESS.md, the task run left", git(self.repo, "log", "--format=%s"))
+        self.assertIn("restored it and running task again", result.stdout)
+        self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md"), "")
+
+    def test_uncommitted_break_is_restored_too(self):
+        fake = FAKE_BREAK_ALWAYS.replace('git commit -q -am "broke the heading"', "true")
+        result = self.run_loop(fake, "--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("- [ ] T1.1 First\n", self.read("PROGRESS.md"))
+        self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md"), "")
+
+    def test_runs_that_keep_breaking_progress_stop_after_the_limit(self):
+        result = self.run_loop(FAKE_BREAK_ALWAYS)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(self.calls(), 3)
+        self.assertEqual(git(self.repo, "log", "--format=%s").count("autoloop: restore PROGRESS.md"), 2)
+        self.assertIn("task field outside a task", result.stdout)
 
     def test_weak_model_for_a_judging_run_is_a_setup_error(self):
         for var in ("PLAN_MODEL", "VERIFY_MODEL", "JUDGE_MODEL"):
