@@ -529,6 +529,16 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertEqual(self.calls(), 0)
         self.assertNotIn("judge run on", result.stdout)
 
+    def test_empty_judge_line_is_still_judged(self):
+        """A run copied a judged question's layout and left "Judge:" empty: the judge still runs on it."""
+        self.block_with_question(OPEN_Q.replace("Answer:", "Judge:\nAnswer:"))
+        self.assertEqual(self.qa("list", "--ids", "--unjudged").stdout.strip(), "1")
+        result = self.run_loop(FAKE_JUDGE_ANSWERS, MAX_ITERATIONS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), 1)
+        self.assertIn("judge run on Q1", result.stdout)
+        self.assertTrue(self.read("PROGRESS.md").startswith("STATUS: RUNNING"))
+
     def test_judge_once_stops_after_the_judge_run(self):
         self.block_with_question()
         result = self.run_loop(FAKE_JUDGE_ANSWERS, "--once")

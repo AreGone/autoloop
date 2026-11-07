@@ -102,10 +102,16 @@ class Question:
 
     @property
     def judge_line(self) -> str | None:
-        """The content of the Judge: line (the judge passed the question to the owner), or None."""
+        """The content of the Judge: line (the judge passed the question to the owner), or None.
+
+        An empty "Judge:" line (a run that copied the layout of a judged question above it) is not a
+        judgement: the question still goes to the judge.
+        """
         for line in self.body_lines:
             if line.lower().startswith("judge:"):
-                return line.split(":", 1)[1].strip()
+                text = line.split(":", 1)[1].strip()
+                if text:
+                    return text
         return None
 
     @property
