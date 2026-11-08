@@ -131,6 +131,31 @@ progress_field() {
 }
 
 #######################################
+# Why a run ended, in one line: the "result" text of its JSON result file with whitespace joined,
+# cut to RUN_REASON_CHARS characters. Says so when the file is missing or carries no result.
+# Arguments:
+#   The result file (may be empty).
+#######################################
+run_reason() {
+  python3 -I - "$1" "${RUN_REASON_CHARS:-700}" <<'PY'
+import json, sys
+path, limit = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as f:
+        text = str(json.load(f).get("result") or "")
+except (OSError, ValueError, AttributeError):
+    text = ""
+text = " ".join(text.split())
+if not text:
+    print("(no result text in the run's result file)")
+elif len(text) > limit:
+    print(text[: limit - 1].rstrip() + "…")
+else:
+    print(text)
+PY
+}
+
+#######################################
 # The id of the next question in QUESTIONS.md: one above the highest "## Q<n>" heading outside a
 # code fence (the format example in the file's header is inside one).
 #######################################
@@ -902,11 +927,12 @@ main() {
       fi
       if (( blocked_after )); then
         sed -i.bak '1s/^STATUS: .*/STATUS: BLOCKED/' "${PROGRESS}" && rm -f "${PROGRESS}.bak"
-        local next_q last_result
+        local next_q last_result reason
         next_q="$(next_question_id)"
         last_result="$(ls -t "${LOG_DIR}"/*-"${stage}".json 2>/dev/null | head -1)"
-        printf '\n## Q%s (%s): no progress after %d %s runs; what should the loop do?\nContext: %d %s runs ended with no commit%s. Last result: %s\nProposed: read that file, fix the cause (a refused command, too few turns, a failing acceptance), answer with the instruction for the next run.\nAnswer:\n' \
-          "${next_q}" "$(date -u +%F)" "${blocked_after}" "${stage}" "${blocked_after}" "${stage}" "${detail}" "${last_result:-none}" >> "${QUESTIONS}"
+        reason="$(run_reason "${last_result}")"
+        printf '\n## Q%s (%s): no progress after %d %s runs; what should the loop do?\nContext: %d %s runs ended with no commit%s. Last result: %s\nThe last run said: %s\nProposed: read that file, fix the cause (a refused command, too few turns, a failing acceptance), answer with the instruction for the next run.\nAnswer:\n' \
+          "${next_q}" "$(date -u +%F)" "${blocked_after}" "${stage}" "${blocked_after}" "${stage}" "${detail}" "${last_result:-none}" "${reason}" >> "${QUESTIONS}"
         git add PROGRESS.md QUESTIONS.md && git commit -q -m "autoloop: blocked after ${blocked_after} runs without progress" || true
         no_progress_blocks=$(( no_progress_blocks + 1 ))
         if (( no_progress_blocks >= 2 )); then
@@ -916,7 +942,7 @@ main() {
         fi
         no_progress=0
         no_commit=0
-        notify "autoloop: BLOCKED, no progress after ${blocked_after} ${stage} runs; the judge reads the last result first"
+        notify "autoloop: BLOCKED, no progress after ${blocked_after} ${stage} runs on $(progress_field MILESTONE). The last run said: ${reason} The judge reads it next."
         continue   # the blocked branch: the judge, then the owner
       fi
     fi

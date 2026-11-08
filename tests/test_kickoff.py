@@ -341,11 +341,20 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         questions = self.read("QUESTIONS.md")
         self.assertIn("\n## Q1 (2026-", questions)
         self.assertIn("2 task runs ended with no commit. Last result:", questions)
+        self.assertIn("\nThe last run said: ok\n", questions)
+        self.assertIn("no progress after 2 task runs on M1. The last run said: ok The judge reads it next.", result.stdout)
         self.assertIn("blocked after 2 runs", git(self.repo, "log", "--format=%s"))
         self.assertIn("judge run changed nothing", result.stdout)
         self.assertIn("telegram (not configured):\nautoloop question 1", result.stdout)
         self.assertFalse((self.loop / "log" / "judge.log").exists())
         self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md", "QUESTIONS.md"), "")
+
+    def test_no_progress_reason_is_one_line_and_cut(self):
+        fake = "#!/usr/bin/env bash\necho x >> \"$FAKE_COUNT\"\n" + (
+            "echo '{\"is_error\": false, \"result\": \"waiting for\\n\\nthe release " + "x" * 50 + "\"}'\n"
+        )
+        self.run_loop(fake, NO_PROGRESS_LIMIT="1", RUN_REASON_CHARS="30")
+        self.assertIn("\nThe last run said: waiting for the release xxxxx…\n", self.read("QUESTIONS.md"))
 
     def test_runs_that_only_touch_progress_block_after_twice_the_limit(self):
         result = self.run_loop(FAKE_APPEND, NO_PROGRESS_LIMIT="2")
