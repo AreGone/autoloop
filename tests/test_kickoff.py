@@ -570,7 +570,7 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
 
     def qa(self, *args: str) -> subprocess.CompletedProcess:
         """Runs qa.py in the repository without Telegram configured."""
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        environ = {**{k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}, **IDENTITY}
         return subprocess.run(
             ["python3", "-I", str(self.loop / "core" / "qa.py"), *args],
             cwd=self.repo,
