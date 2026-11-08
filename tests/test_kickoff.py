@@ -126,7 +126,8 @@ FAKE_GH = """#!/usr/bin/env bash
 # Scripted gh: the pull request is open at FAKE_HEAD (default: the local HEAD), its one check
 # failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
 # commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
-# that green is read, as a push from outside the loop would.
+# that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
+# GitHub's billing refusal instead of the warning.
 case "$*" in
   *"pr view"*"state"*) echo OPEN ;;
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
@@ -141,7 +142,13 @@ case "$*" in
   *"run view 42 --log-failed"*) printf 'gate\\tTest\\t##[error]Process completed with exit code 1.\\n' ;;
   *"run view 42 --json jobs"*) echo gate ;;
   *"actions/runs/42/jobs"*) echo 7 ;;
-  *"check-runs/7/annotations"*) echo "warning: .github:2 Node.js 20 is deprecated; action x targets it" ;;
+  *"check-runs/7/annotations"*)
+    if [ -n "${FAKE_BILLING:-}" ]; then
+      echo "failure: .github:1 The job was not started because recent account payments have failed" \
+        "or your spending limit needs to be increased."
+    else
+      echo "warning: .github:2 Node.js 20 is deprecated; action x targets it"
+    fi ;;
   *) exit 1 ;;
 esac
 """
@@ -151,6 +158,8 @@ PR_FUNCTIONS = ";".join(
         "wait_for_pr",
         "reopen_for_ci",
         "run_annotations",
+        "billing_refused",
+        "run_local_gate",
         "consider_annotations",
         "next_question_id",
         "write_pr_body",
@@ -244,6 +253,7 @@ HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; REPO_ROOT={self.repo}
 LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
 PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
+LOCAL_GATE="${{LOCAL_GATE:-true}}"; LOCAL_GATE_TIMEOUT_S=60
 log() {{ echo "LOG: $*"; }}
 notify() {{ echo "NOTIFY: $*"; }}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
@@ -759,6 +769,42 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         result = self.call("wait_for_pr")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+
+    def test_billing_refusal_runs_the_local_gate_and_waits_for_the_merge_when_green(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        marker = self.tmp / "gate-ran"
+        result = self.call("wait_for_pr", timeout=4, FAKE_BILLING="1", LOCAL_GATE=f"echo x >> {marker}")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("NOTIFY:"), 1, result.stderr)
+        self.assertIn("the local gate is green", result.stderr)
+        self.assertIn("refused to start CI", result.stderr)
+        # Once per head, not on every poll.
+        self.assertEqual(marker.read_text(), "x\n")
+
+    def test_billing_refusal_with_a_red_local_gate_reports_the_gate(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        git(self.repo, "commit", "-q", "-am", "done")
+        sha = git(self.repo, "rev-parse", "--short", "HEAD").strip()
+        result = self.call(
+            "wait_for_pr", FAKE_BILLING="1", LOCAL_GATE="echo 'make: *** [Makefile:4: test-fast] Error 2'; exit 2"
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        gate_log = self.tmp / "log" / f"local-gate-{sha}.log"
+        self.assertEqual(result.stdout.strip(), f"fail local-gate {gate_log}")
+        reopened = self.call("reopen_for_ci", result.stdout.strip())
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        progress = self.read("PROGRESS.md")
+        self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check local-gate failed on {sha}", progress)
+        self.assertIn("  - acceptance: `tools/lint/lint.sh && make test-fast`\n", progress)
+        self.assertIn("test-fast] Error 2", (self.tmp / "log" / f"ci-M1-{sha}.log").read_text())
+
+    def test_a_failure_that_is_not_billing_is_not_covered_by_the_local_gate(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        marker = self.tmp / "gate-ran"
+        result = self.call("wait_for_pr", LOCAL_GATE=f"echo x >> {marker}")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(marker.exists())
 
     def test_checks_are_judged_only_on_the_pull_request_head(self):
         self.write_progress(DONE_HEADER + TASK + LOG)

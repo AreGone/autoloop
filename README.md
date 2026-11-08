@@ -38,6 +38,11 @@ kickoff.sh loop
   │                             RUNNING, Telegram; task and verify runs handle it, the planning run
   │                             re-runs the acceptance, the loop pushes and watches again; after
   │                             CI_REOPEN_LIMIT such tasks in one milestone: STATUS BLOCKED with a question
+  │   CI refused (billing)   -> every failing check is a job GitHub would not start for a failed payment
+  │                             or the spending limit (its annotation says so): the checks are not
+  │                             relied on; LOCAL_GATE runs once per head (log/local-gate-<sha>.log);
+  │                             green waits for the merge, red is the check "local-gate" and reopens
+  │                             the milestone like a red check
   │   green with warnings    -> the run's warning annotations are saved under log/ci-annotations-<sha>.txt
   │                             and the milestone reopened once per set so the planning run considers
   │                             them: a task, a question, or a Log line saying why nothing is needed
