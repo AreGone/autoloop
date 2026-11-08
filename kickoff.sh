@@ -62,6 +62,9 @@ readonly MERGE_POLL_S="${MERGE_POLL_S:-600}"
 readonly CHECK_POLL_S="${CHECK_POLL_S:-120}"
 readonly CI_REOPEN_LIMIT="${CI_REOPEN_LIMIT:-3}"
 readonly CI_FIX_ACCEPTANCE="${CI_FIX_ACCEPTANCE:-tools/lint/lint.sh}"
+# Run in place of CI when GitHub refuses to start the jobs for billing (bash -c, from the repository root).
+readonly LOCAL_GATE="${LOCAL_GATE:-${CI_FIX_ACCEPTANCE}}"
+readonly LOCAL_GATE_TIMEOUT_S="${LOCAL_GATE_TIMEOUT_S:-7200}"
 readonly PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-60000}"
 readonly GIT_REMOTE="${GIT_REMOTE:-origin}"
 readonly BASE_BRANCH="${BASE_BRANCH:-main}"
@@ -493,6 +496,43 @@ write_pr_body_full() {
 }
 
 #######################################
+# The HISTORY.md entry of a finished milestone, wrapped at 80 columns with a two-space continuation indent.
+# The bold prefix stays whole on the first line, and no continuation line starts with a word that Markdown
+# would read as markup (a list marker, heading, quote or table): the previous word moves down with it.
+# Arguments:
+#   The date, the milestone id, the title and the archive path.
+#######################################
+history_line() {
+  python3 -I - "$@" <<'PY'
+import re
+import sys
+
+date, milestone, title, path = sys.argv[1:5]
+prefix = f"- **{date}, milestone {milestone} done.**"
+words = [prefix] + f"{title} ({path}).".split()
+markup = re.compile(r"^([-+*#>|<=~`]|\d+[.)])")
+lines = [[words[0]]]
+for word in words[1:]:
+    if len(("  " if len(lines) > 1 else "") + " ".join(lines[-1] + [word])) <= 80:
+        lines[-1].append(word)
+        continue
+    new = [word]
+    moved = []
+    while markup.match(new[0]) and len(lines[-1]) > 1:
+        moved.append(lines[-1].pop())
+        new.insert(0, moved[-1])
+    if len("  " + " ".join(new)) > 80 or markup.match(new[0]):
+        lines[-1].extend(reversed(moved))
+        new = [word]
+    lines.append(new)
+out = []
+for number, line in enumerate(lines):
+    out.append(("  " if number else "") + " ".join(line))
+print("\n".join(out))
+PY
+}
+
+#######################################
 # Archive the working files of the finished milestone under archive/<milestone>/ of the project's
 # autoloop directory, add the milestone's line to HISTORY.md, and commit on the milestone branch
 # (so it is in its pull request). Idempotent: a second call with nothing new to archive commits nothing.
@@ -511,8 +551,11 @@ archive_milestone() {
       > "${dir}/ACCEPTANCE.md" 2>/dev/null || true
   fi
   if ! grep -q "milestone ${milestone} done" "${REPO_ROOT}/HISTORY.md"; then
-    printf -- '- **%s, milestone %s done.** %s (%s/archive/%s).\n' \
-      "$(date -u +%F)" "${milestone}" "$(milestone_title "${milestone}")" "${AUTOLOOP_REL}" "${milestone}" >> "${REPO_ROOT}/HISTORY.md"
+    if [[ -s "${REPO_ROOT}/HISTORY.md" && -n "$(tail -c 1 "${REPO_ROOT}/HISTORY.md")" ]]; then
+      echo >> "${REPO_ROOT}/HISTORY.md"
+    fi
+    history_line "$(date -u +%F)" "${milestone}" "$(milestone_title "${milestone}")" \
+      "${AUTOLOOP_REL}/archive/${milestone}" >> "${REPO_ROOT}/HISTORY.md"
   fi
   git add "${AUTOLOOP_REL}/archive/${milestone}" HISTORY.md
   git diff --cached --quiet || git commit -q -m "Archive ${milestone}: working files, pull request body, acceptance"
@@ -630,19 +673,54 @@ consider_annotations() {
 }
 
 #######################################
+# True when every failing check is a job GitHub refused to start for billing (a failed payment or
+# the spending limit): no step ran, so the check says nothing about the code.
+# Arguments:
+#   The failing check lines from gh, "<bucket> <name> <link>".
+#######################################
+billing_refused() {
+  local ids id
+  ids="$(grep -oE 'runs/[0-9]+' <<< "$1" | cut -d/ -f2 | sort -u)"
+  [[ -n "${ids}" ]] || return 1
+  for id in ${ids}; do
+    run_annotations "${id}" | grep -qiE 'account payments have failed|spending limit' || return 1
+  done
+}
+
+#######################################
+# The local stand-in for CI: runs LOCAL_GATE from the repository root, its output saved under log/.
+# Outputs:
+#   The log file.
+# Returns:
+#   The gate's exit status.
+#######################################
+run_local_gate() {
+  local file rc=0
+  file="${LOG_DIR}/local-gate-$(git rev-parse --short HEAD).log"
+  { echo "# local gate: ${LOCAL_GATE}"; timeout "${LOCAL_GATE_TIMEOUT_S:-7200}" bash -c "${LOCAL_GATE}"; } > "${file}" 2>&1 || rc=$?
+  echo "${file}"
+  return "${rc}"
+}
+
+#######################################
 # Block until the branch's pull request is merged, closed, or a check fails on its head commit.
 # Checks are read with gh (buckets pass, fail, pending, skipping, cancel) and only when the pull
 # request's head is the local HEAD, so a stale rollup from the previous push is never judged.
-# A pull request without any check is only waited on for the merge.
+# The head is read again on every pass: a commit pushed after the checks went green (a merge of
+# the base branch, a fix pushed by hand) is judged like the loop's own push. When the pull
+# request's head is ahead of the local HEAD, the branch is fast-forwarded to it first; a head that
+# cannot be fast-forwarded to is left alone and only the merge is waited on.
+# A pull request without any check is only waited on for the merge. When every failing check is a
+# job GitHub refused to start for billing, CI is not relied on: LOCAL_GATE runs once on that head,
+# green waits for the merge, red is reported as the check "local-gate" whose link is the gate's log.
 # Outputs:
 #   On a failed check: one line per failing check, "<bucket> <name> <link>".
 # Returns:
 #   0 merged, 1 closed unmerged, 2 a check failed or was cancelled, 3 withdrawn to consider annotations.
 #######################################
 wait_for_pr() {
-  local branch head state pr_head checks failing green_told=0 empty_polls=0
+  local branch head judged="" state pr_head checks failing green_told=0 empty_polls=0 local_green=""
   branch="$(git rev-parse --abbrev-ref HEAD)"
-  head="$(git rev-parse HEAD)"
   while true; do
     state="$(gh pr view "${branch}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
     case "${state}" in
@@ -650,12 +728,44 @@ wait_for_pr() {
       CLOSED) return 1 ;;
     esac
     pr_head="$(gh pr view "${branch}" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+    head="$(git rev-parse HEAD)"
+    if [[ -n "${pr_head}" && "${pr_head}" != "${head}" ]] \
+      && git fetch -q "${GIT_REMOTE:-origin}" "${branch}" 2>/dev/null \
+      && [[ "$(git rev-parse FETCH_HEAD)" == "${pr_head}" ]] \
+      && git merge-base --is-ancestor HEAD FETCH_HEAD \
+      && git merge -q --ff-only FETCH_HEAD >/dev/null 2>&1; then
+      log "pull request head moved to ${pr_head}; fast-forwarded ${branch} to it" >&2
+      head="${pr_head}"
+    fi
+    if [[ "${head}" != "${judged}" ]]; then
+      # A new head: its checks are judged afresh and green is told again.
+      judged="${head}"
+      green_told=0
+      empty_polls=0
+    fi
     checks=""
     if [[ "${pr_head}" == "${head}" ]]; then
       # gh exits 1 on a failing check and 8 on a pending one; the output is what matters here.
       checks="$(gh pr checks "${branch}" --json name,bucket,link --jq '.[] | "\(.bucket) \(.name) \(.link)"' 2>/dev/null || true)"
     fi
     failing="$(grep -E '^(fail|cancel) ' <<< "${checks}" || true)"
+    if [[ -n "${failing}" ]] && billing_refused "${failing}"; then
+      # GitHub did not start the jobs (billing): the local gate stands in for CI on this head.
+      if [[ "${local_green}" != "${head}" ]]; then
+        local gate_log
+        log "GitHub refused to start CI on ${head} for billing; running the local gate: ${LOCAL_GATE}" >&2
+        if gate_log="$(run_local_gate)"; then
+          local_green="${head}"
+          log "local gate green on ${branch} at ${head} (${gate_log}); waiting for the merge" >&2
+          notify "autoloop: GitHub did not start CI on the pull request for $(progress_field MILESTONE) (billing or spending limit); the local gate is green on ${head:0:7} instead. Waiting for the merge." >&2
+        else
+          echo "fail local-gate ${gate_log}"
+          return 2
+        fi
+      fi
+      sleep "${MERGE_POLL_S}"
+      continue
+    fi
     if [[ -n "${failing}" ]]; then
       echo "${failing}"
       return 2
@@ -679,8 +789,8 @@ wait_for_pr() {
         return 3
       fi
       green_told=1
-      log "checks green on ${branch} at ${head}; waiting for the merge"
-      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge."
+      log "checks green on ${branch} at ${head}; waiting for the merge" >&2
+      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge." >&2
     fi
     sleep "${MERGE_POLL_S}"
   done
@@ -706,7 +816,10 @@ reopen_for_ci() {
   : > "${logfile}"
   while read -r _bucket _name link; do
     run_id="$(grep -oE 'runs/[0-9]+' <<< "${link}" | head -1 | cut -d/ -f2)"
-    if [[ -n "${run_id}" ]]; then
+    if [[ -f "${link}" ]]; then
+      # The local gate's own log (CI refused for billing).
+      cat "${link}" >> "${logfile}"
+    elif [[ -n "${run_id}" ]]; then
       { echo "# ${link}"; gh run view "${run_id}" --log-failed 2>&1 || true; } >> "${logfile}"
     fi
   done <<< "${failing}"

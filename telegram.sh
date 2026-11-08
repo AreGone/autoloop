@@ -24,6 +24,7 @@ readonly ENV_FILE="${AUTOLOOP_DIR}/autoloop.env"
 readonly LOG_DIR="${AUTOLOOP_DIR}/log"
 # The epoch of the last status report: the next one covers everything since.
 readonly STATUS_STAMP="${LOG_DIR}/status.last"
+readonly TELEGRAM_MAX_CHARS=4000
 
 if [[ -f "${ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -37,6 +38,11 @@ fi
 #######################################
 send() {
   local text="$1"
+  # Telegram refuses a message over 4096 characters (and an empty one): cut it short with a mark.
+  if (( ${#text} > TELEGRAM_MAX_CHARS )); then
+    text="${text:0:$(( TELEGRAM_MAX_CHARS - 16 ))}
+(... cut short)"
+  fi
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
     printf 'telegram (not configured): %s\n' "${text}"
     return 0
@@ -88,8 +94,9 @@ status_text() {
   branch="$(git rev-parse --abbrev-ref HEAD)"
   since="$(cat "${STATUS_STAMP}" 2>/dev/null || true)"
   [[ "${since}" =~ ^[0-9]+$ ]] || since=$(( $(date -u +%s) - 3600 ))
-  commits="$(git log --since="@${since}" --format='- %s' | head -8)"
-  judge="$(python3 -I "${HERE}/qa.py" judge-log --since "${since}" | head -8)"
+  # head stops reading early; the writer's broken pipe must not fail the report under pipefail.
+  commits="$(git log --since="@${since}" --format='- %s' 2>/dev/null | head -8 || true)"
+  judge="$(python3 -I "${HERE}/qa.py" judge-log --since "${since}" 2>/dev/null | head -8 || true)"
   printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)\ncommits since the last report:\n%s\njudge:\n%s\n' \
     "${milestone}" "${status}" "${branch}" "${open}" "${prog}" "${reopened}" "${done_}" "${verifying}" \
     "${commits:-- none}" "${judge:-- nothing answered or passed}"

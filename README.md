@@ -25,17 +25,24 @@ kickoff.sh loop
   │                             replies, records them, sets RUNNING, continues; exit 2 only without
   │                             Telegram or after ANSWER_WAIT_S. Answers and passes: log/judge.log
   ├── STATUS MILESTONE_DONE  -> archive PROGRESS.md, QUESTIONS.md, the pull request body and the
-  │                             acceptance result under archive/<milestone>/ (+ a HISTORY.md line),
+  │                             acceptance result under archive/<milestone>/ (+ a HISTORY.md line,
+  │                             wrapped at 80 columns),
   │                             push the branch, open the pull request (gh), Telegram the URL, watch
   │                             its checks: a red check reopens the milestone (below); green waits
   │                             for the merge, tags it milestone/<id>, then starts the next milestone of
   │                             MILESTONES.md on autoloop/<next> from the merged base branch with fresh
   │                             PROGRESS.md and QUESTIONS.md; exit 0 after the last one
   │   red check on the PR     -> the failed job log is saved under log/ci-<milestone>-<sha>.log, a task
-  │                             "Make CI green" (ci_task.py) is added with the first error lines, STATUS
+  │                             "Make CI green" (ci_task.py) is added with the first error lines and
+  │                             an acceptance that re-runs the failed make targets, STATUS
   │                             RUNNING, Telegram; task and verify runs handle it, the planning run
   │                             re-runs the acceptance, the loop pushes and watches again; after
   │                             CI_REOPEN_LIMIT such tasks in one milestone: STATUS BLOCKED with a question
+  │   CI refused (billing)   -> every failing check is a job GitHub would not start for a failed payment
+  │                             or the spending limit (its annotation says so): the checks are not
+  │                             relied on; LOCAL_GATE runs once per head (log/local-gate-<sha>.log);
+  │                             green waits for the merge, red is the check "local-gate" and reopens
+  │                             the milestone like a red check
   │   green with warnings    -> the run's warning annotations are saved under log/ci-annotations-<sha>.txt
   │                             and the milestone reopened once per set so the planning run considers
   │                             them: a task, a question, or a Log line saying why nothing is needed
@@ -196,7 +203,7 @@ defined.
 | `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request |
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
-| `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails |
+| `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
 | `prompts/judge.md` | the judge's prompt; a project's `prompts/judge.md` replaces it |
 | `hooks/guard.sh` | PreToolUse guard for Bash; sources the project's `hooks/rules.sh` |
 | `autoloop.env.example` | every setting with its default |

@@ -3,13 +3,72 @@
 Called by kickoff.sh when a check failed on the milestone's pull request.
 Arguments: PROGRESS.md path, milestone id, short sha, failing check names,
 pull request url, the saved failed-log path, the acceptance command.
+The task's acceptance is that command followed by each make target that failed
+in the log, so the verifier re-runs what CI ran, not only the lint gate.
 Prints the new task id.
 """
 
 import datetime
 import pathlib
 import re
+import subprocess
 import sys
+
+_MAKE_FAIL = re.compile(r"\bmake(?:\[(\d+)\])?: \*\*\* \[(?:[^\]]*?:\d+: )?([^\]\s]+)\] Error \d+")
+_MAKE_DIR = re.compile(r"\bmake\[(\d+)\]: Entering directory '([^']+)'")
+
+
+def _local_dir(remote: str, root: pathlib.Path) -> str | None:
+    """The directory of the repository that a runner's absolute path names, relative to the root ("" for the root).
+
+    The runner checks the repository out elsewhere, so the longest tail of the path that is a directory of this
+    checkout with a Makefile is taken; None when no tail is.
+    """
+    parts = pathlib.PurePosixPath(remote).parts
+    for start in range(1, len(parts) + 1):
+        tail = pathlib.Path(*parts[start:]) if parts[start:] else pathlib.Path()
+        if (root / tail / "Makefile").is_file():
+            return tail.as_posix() if parts[start:] else ""
+    return None
+
+
+def failed_make_commands(log_text: list[str], root: pathlib.Path) -> list[str]:
+    """The `make` command of the innermost failed target of each failed job in the log, in log order, unique.
+
+    make reports a failure from the innermost level outwards, so the first `*** [...] Error` line after a job's
+    `# http` header is the target that failed; its directory comes from that level's last `Entering directory`
+    line (none at level 0: the step's own directory, taken as the root).
+    """
+    commands: list[str] = []
+    dirs: dict[int, str] = {}
+    found = False
+    for raw in log_text:
+        if raw.startswith("# http"):
+            dirs, found = {}, False
+            continue
+        if found:
+            continue
+        if m := _MAKE_DIR.search(raw):
+            dirs[int(m.group(1))] = m.group(2)
+            continue
+        if m := _MAKE_FAIL.search(raw):
+            found = True
+            level = int(m.group(1) or 0)
+            where = _local_dir(dirs[level], root) if level in dirs else ""
+            if where is None:
+                continue
+            command = f"make -C {where} {m.group(2)}" if where else f"make {m.group(2)}"
+            if command not in commands:
+                commands.append(command)
+    return commands
+
+
+def _repo_root(progress: pathlib.Path) -> pathlib.Path:
+    """The top of the git checkout that holds PROGRESS.md, or its directory outside git."""
+    result = subprocess.run(
+        ["git", "-C", str(progress.parent), "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False
+    )
+    return pathlib.Path(result.stdout.strip()) if result.returncode == 0 else progress.parent.resolve()
 
 
 def main() -> None:
@@ -27,6 +86,8 @@ def main() -> None:
     error_text = (
         "; ".join(errors) if errors else "no ##[error] line in the log; read it from the start of the failed step"
     )
+    reruns = [c for c in failed_make_commands(log_text, _repo_root(pathlib.Path(path))) if c != acceptance]
+    acceptance = " && ".join([acceptance, *reruns])
 
     entry = [
         f"- [ ] {task_id} Make CI green on the pull request: check {names} failed on {sha}",

@@ -124,16 +124,31 @@ echo '{"is_error": false, "result": "ok"}'
 """
 FAKE_GH = """#!/usr/bin/env bash
 # Scripted gh: the pull request is open at FAKE_HEAD (default: the local HEAD), its one check
-# failed, run 42 has one failed job and a two-line log.
+# failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
+# commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
+# that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
+# GitHub's billing refusal instead of the warning.
 case "$*" in
   *"pr view"*"state"*) echo OPEN ;;
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
   *"pr view"*"url"*) echo "https://example.invalid/pr/1" ;;
-  *"pr checks"*) echo "fail gate https://example.invalid/actions/runs/42/job/7" ;;
+  *"pr checks"*)
+    if [ -n "${FAKE_GREEN_AT:-}" ] && [ "$(git rev-parse HEAD)" = "$FAKE_GREEN_AT" ]; then
+      echo "pass gate https://example.invalid/actions/runs/43/job/8"
+      if [ -n "${FAKE_THEN_COMMIT:-}" ]; then git commit -q --allow-empty -m "pushed after green"; fi
+    else
+      echo "fail gate https://example.invalid/actions/runs/42/job/7"
+    fi ;;
   *"run view 42 --log-failed"*) printf 'gate\\tTest\\t##[error]Process completed with exit code 1.\\n' ;;
   *"run view 42 --json jobs"*) echo gate ;;
   *"actions/runs/42/jobs"*) echo 7 ;;
-  *"check-runs/7/annotations"*) echo "warning: .github:2 Node.js 20 is deprecated; action x targets it" ;;
+  *"check-runs/7/annotations"*)
+    if [ -n "${FAKE_BILLING:-}" ]; then
+      echo "failure: .github:1 The job was not started because recent account payments have failed" \
+        "or your spending limit needs to be increased."
+    else
+      echo "warning: .github:2 Node.js 20 is deprecated; action x targets it"
+    fi ;;
   *) exit 1 ;;
 esac
 """
@@ -143,11 +158,15 @@ PR_FUNCTIONS = ";".join(
         "wait_for_pr",
         "reopen_for_ci",
         "run_annotations",
+        "billing_refused",
+        "run_local_gate",
         "consider_annotations",
         "next_question_id",
         "write_pr_body",
         "write_pr_body_full",
         "milestone_title",
+        "history_line",
+        "archive_milestone",
     )
 )
 
@@ -234,6 +253,7 @@ HERE={self.loop}/core; AUTOLOOP_REL=tools/autoloop; REPO_ROOT={self.repo}
 LOG_DIR={log_dir}; RUN_LOG={log_dir}/kickoff.log
 PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
+LOCAL_GATE="${{LOCAL_GATE:-true}}"; LOCAL_GATE_TIMEOUT_S=60
 log() {{ echo "LOG: $*"; }}
 notify() {{ echo "NOTIFY: $*"; }}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
@@ -250,6 +270,90 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
             timeout=timeout + 5,
             check=False,
         )
+
+    # History line
+
+    def history(self, title: str, milestone: str = "M14", date: str = "2026-11-08") -> list[str]:
+        """The lines history_line prints for a title."""
+        result = self.call("history_line", date, milestone, title, f"tools/autoloop/archive/{milestone}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_history_line_wraps_the_m14_entry(self):
+        self.assertEqual(
+            self.history("auth and admin app"),
+            ["- **2026-11-08, milestone M14 done.** auth and admin app", "  (tools/autoloop/archive/M14)."],
+        )
+
+    def test_history_line_short_title_is_one_line(self):
+        self.assertEqual(
+            self.history("first", "M1"), ["- **2026-11-08, milestone M1 done.** first (tools/autoloop/archive/M1)."]
+        )
+
+    def test_history_line_long_title_wraps_at_80(self):
+        title = " ".join(f"word{i:02d}" for i in range(30))[:200]
+        lines = self.history(title)
+        self.assertGreater(len(lines), 2)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertTrue(all(line.startswith("  ") and not line.startswith("   ") for line in lines[1:]))
+        self.assertTrue(lines[0].startswith("- **2026-11-08, milestone M14 done.** "))
+        self.assertEqual(
+            " ".join(" ".join(lines).split()),
+            f"- **2026-11-08, milestone M14 done.** {title} (tools/autoloop/archive/M14).",
+        )
+
+    def test_history_line_continuation_never_starts_with_markup(self):
+        carried = 0
+        for marker in ("-", "#", ">", "1."):
+            for pad in range(40, 43):
+                lines = self.history("x" * pad + f" {marker} tail words")
+                for line in lines[1:]:
+                    self.assertNotRegex(line.lstrip(), r"^([-+*#>|<=~`]|\d+[.)])", (marker, pad, lines))
+                    self.assertLessEqual(len(line), 80, lines)
+                # The marker crossed column 80, so the word before it moved down with it.
+                if lines[1].startswith("  " + "x" * pad + f" {marker}"):
+                    carried += 1
+        self.assertGreaterEqual(carried, 4)
+
+    def test_history_line_markup_carry_never_exceeds_80_columns(self):
+        lines = self.history(" ".join(["-"] * 40))
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+
+    def test_history_line_carry_that_would_overflow_is_undone(self):
+        lines = self.history("- " * 20 + "-" + "x" * 40 + " tail")
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+
+    def test_history_line_carry_stopped_by_a_plain_word_is_undone_by_length(self):
+        # The carry stops on the plain word, so only the length check undoes it.
+        lines = self.history("p" * 41 + " b " + "y" * 60 + " - - -" + "x" * 20)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertEqual(lines[1], "  b " + "y" * 60 + " - -")
+
+    def test_history_line_long_markup_run_does_not_degrade_to_one_word_per_line(self):
+        lines = self.history("aa " + "- " * 60)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertTrue(all(len(line) >= 10 for line in lines[:-1]), lines)
+
+    def test_history_line_empty_title_has_no_double_space(self):
+        lines = self.history("")
+        self.assertEqual(lines, ["- **2026-11-08, milestone M14 done.** (tools/autoloop/archive/M14)."])
+        self.assertNotIn("  ", lines[0])
+
+    def test_archive_milestone_repairs_a_missing_final_newline_and_is_idempotent(self):
+        history = self.repo / "HISTORY.md"
+        history.write_text("# History\n\n- last line")
+        env = {"ARCHIVE_ROOT": str(self.loop / "archive")}
+        self.assertEqual(self.call("archive_milestone", **env).returncode, 0)
+        text = history.read_text()
+        self.assertEqual(text.splitlines()[:3], ["# History", "", "- last line"])
+        self.assertRegex(
+            text.splitlines()[3], r"^- \*\*\d{4}-\d\d-\d\d, milestone M1 done\.\*\* first \(\S+/archive/M1\)\.$"
+        )
+        self.assertEqual(len(text.splitlines()), 4)
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(self.call("archive_milestone", **env).returncode, 0)
+        self.assertEqual(history.read_text(), text)
 
     # Stage choice
 
@@ -493,7 +597,7 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
 
     def qa(self, *args: str) -> subprocess.CompletedProcess:
         """Runs qa.py in the repository without Telegram configured."""
-        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        environ = {**{k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}, **IDENTITY}
         return subprocess.run(
             ["python3", "-I", str(self.loop / "core" / "qa.py"), *args],
             cwd=self.repo,
@@ -596,6 +700,42 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
 
+    def test_status_report_survives_a_long_backlog_and_is_cut_to_the_limit(self):
+        # A day of failed sends leaves an old stamp and more judge lines than the report shows: the
+        # writer's broken pipe must not empty the report, and the message stays under Telegram's limit.
+        log_dir = self.loop / "log"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "status.last").write_text("1000000000\n")
+        (log_dir / "judge.log").write_text(
+            "".join(f"2026-11-08T10:{i % 60:02d}:00Z Q{i} answered: " + "x" * 600 + "\n" for i in range(400))
+        )
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        text = subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), "status-text"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("autoloop M1 | RUNNING", text.stdout)
+        self.assertEqual(text.stdout.count(" answered: "), 8)
+        sent = subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), "status"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        message = sent.stdout.removeprefix("telegram (not configured): ").rstrip("\n")
+        self.assertLessEqual(len(message), 4000)
+        self.assertTrue(message.endswith("(... cut short)"))
+
     def test_status_report_counts_done_tasks_awaiting_verification(self):
         # Two done tasks, one verified and one not, and an open one: done 2, verifying 1.
         verified = (
@@ -639,11 +779,73 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
 
+    def test_billing_refusal_runs_the_local_gate_and_waits_for_the_merge_when_green(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        marker = self.tmp / "gate-ran"
+        result = self.call("wait_for_pr", timeout=4, FAKE_BILLING="1", LOCAL_GATE=f"echo x >> {marker}")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("NOTIFY:"), 1, result.stderr)
+        self.assertIn("the local gate is green", result.stderr)
+        self.assertIn("refused to start CI", result.stderr)
+        # Once per head, not on every poll.
+        self.assertEqual(marker.read_text(), "x\n")
+
+    def test_billing_refusal_with_a_red_local_gate_reports_the_gate(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        git(self.repo, "commit", "-q", "-am", "done")
+        sha = git(self.repo, "rev-parse", "--short", "HEAD").strip()
+        result = self.call(
+            "wait_for_pr", FAKE_BILLING="1", LOCAL_GATE="echo 'make: *** [Makefile:4: test-fast] Error 2'; exit 2"
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        gate_log = self.tmp / "log" / f"local-gate-{sha}.log"
+        self.assertEqual(result.stdout.strip(), f"fail local-gate {gate_log}")
+        reopened = self.call("reopen_for_ci", result.stdout.strip())
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        progress = self.read("PROGRESS.md")
+        self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check local-gate failed on {sha}", progress)
+        self.assertIn("  - acceptance: `tools/lint/lint.sh && make test-fast`\n", progress)
+        self.assertIn("test-fast] Error 2", (self.tmp / "log" / f"ci-M1-{sha}.log").read_text())
+
+    def test_a_failure_that_is_not_billing_is_not_covered_by_the_local_gate(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        marker = self.tmp / "gate-ran"
+        result = self.call("wait_for_pr", LOCAL_GATE=f"echo x >> {marker}")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(marker.exists())
+
     def test_checks_are_judged_only_on_the_pull_request_head(self):
         self.write_progress(DONE_HEADER + TASK + LOG)
         result = self.call("wait_for_pr", timeout=3, FAKE_HEAD="f" * 40)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_commit_after_green_is_judged_again(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        green = git(self.repo, "rev-parse", "HEAD").strip()
+        result = self.call("wait_for_pr", FAKE_GREEN_AT=green, FAKE_THEN_COMMIT="1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"checks green on autoloop/M1 at {green}", result.stderr)
+        self.assertNotEqual(git(self.repo, "rev-parse", "HEAD").strip(), green)
+
+    def test_push_from_outside_is_fast_forwarded_and_judged(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        remote = self.tmp / "remote.git"
+        git(self.tmp, "init", "-q", "--bare", str(remote))
+        git(self.repo, "remote", "add", "origin", str(remote))
+        git(self.repo, "push", "-q", "origin", "autoloop/M1")
+        other = self.tmp / "other"
+        git(self.tmp, "clone", "-q", "-b", "autoloop/M1", str(remote), str(other))
+        git(other, "commit", "-q", "--allow-empty", "-m", "merge main")
+        git(other, "push", "-q", "origin", "autoloop/M1")
+        pushed = git(other, "rev-parse", "HEAD").strip()
+        result = self.call("wait_for_pr", FAKE_HEAD=pushed)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"pull request head moved to {pushed}", result.stderr)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), pushed)
 
     def test_red_check_reopens_the_milestone_with_a_fix_task(self):
         self.write_progress(DONE_HEADER + TASK + LOG)
@@ -656,10 +858,65 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check gate failed on {sha}", progress)
         self.assertIn("Process completed with exit code 1", progress)
         self.assertIn("##[error]", (self.tmp / "log" / f"ci-M1-{sha}.log").read_text())
+        self.assertIn("  - acceptance: `tools/lint/lint.sh`\n", progress)
         self.assertEqual(
             git(self.repo, "log", "-1", "--format=%s"), "Reopen M1: CI red on the pull request, T1.2 makes it green\n"
         )
         self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md"), "")
+
+    def ci_task(self, log: str) -> str:
+        """Runs ci_task.py on a saved log in the repository and returns the new task's acceptance line."""
+        logfile = self.tmp / "ci.log"
+        logfile.write_text(log)
+        subprocess.run(
+            [
+                "python3",
+                "-I",
+                str(self.loop / "core" / "ci_task.py"),
+                str(self.repo / "PROGRESS.md"),
+                "M1",
+                "abc1234",
+                "tests",
+                "https://example.invalid/pull/1",
+                str(logfile),
+                "tools/lint/lint.sh",
+            ],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return next(line for line in self.read("PROGRESS.md").splitlines() if line.startswith("  - acceptance: `tools"))
+
+    def test_fix_task_acceptance_reruns_the_innermost_failed_make_target_of_each_job(self):
+        (self.repo / "Makefile").write_text("all:\n")
+        (self.repo / "svc" / "sim").mkdir(parents=True)
+        (self.repo / "svc" / "sim" / "Makefile").write_text("test:\n")
+        runner = "/home/runner/work/proj/proj"
+        prefix = "tests\tRun the suites\t2026-11-08T12:00:00.0000000Z "
+        log = "".join(
+            prefix + line + "\n"
+            for line in (
+                f"make[1]: Entering directory '{runner}'",
+                f"make[2]: Entering directory '{runner}/svc/sim'",
+                "E   AssertionError: make[9]: *** [Makefile:1: not-a-failure-line]",
+                "make[2]: *** [Makefile:3: test] Error 1",
+                f"make[2]: Leaving directory '{runner}/svc/sim'",
+                "make[1]: *** [Makefile:12: test-all] Error 2",
+                "make: *** [Makefile:4: test-fast] Error 2",
+                "##[error]Process completed with exit code 2.",
+            )
+        )
+        log = "# https://example.invalid/actions/runs/42/job/7\n" + log
+        log += "# https://example.invalid/actions/runs/42/job/8\n"
+        log += "lint\tLint\t2026-11-08T12:00:00.0000000Z make: *** [lint] Error 1\n"
+        self.assertEqual(self.ci_task(log), "  - acceptance: `tools/lint/lint.sh && make -C svc/sim test && make lint`")
+
+    def test_fix_task_acceptance_is_the_configured_command_without_a_failed_make_target(self):
+        log = "# https://example.invalid/actions/runs/42/job/7\n"
+        log += "gate\tTest\t##[error]Process completed with exit code 1.\n"
+        self.assertEqual(self.ci_task(log), "  - acceptance: `tools/lint/lint.sh`")
 
     def test_fix_tasks_are_capped_with_a_question(self):
         fix = (
