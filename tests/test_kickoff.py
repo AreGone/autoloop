@@ -733,10 +733,65 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check gate failed on {sha}", progress)
         self.assertIn("Process completed with exit code 1", progress)
         self.assertIn("##[error]", (self.tmp / "log" / f"ci-M1-{sha}.log").read_text())
+        self.assertIn("  - acceptance: `tools/lint/lint.sh`\n", progress)
         self.assertEqual(
             git(self.repo, "log", "-1", "--format=%s"), "Reopen M1: CI red on the pull request, T1.2 makes it green\n"
         )
         self.assertEqual(git(self.repo, "status", "--porcelain", "PROGRESS.md"), "")
+
+    def ci_task(self, log: str) -> str:
+        """Runs ci_task.py on a saved log in the repository and returns the new task's acceptance line."""
+        logfile = self.tmp / "ci.log"
+        logfile.write_text(log)
+        subprocess.run(
+            [
+                "python3",
+                "-I",
+                str(self.loop / "core" / "ci_task.py"),
+                str(self.repo / "PROGRESS.md"),
+                "M1",
+                "abc1234",
+                "tests",
+                "https://example.invalid/pull/1",
+                str(logfile),
+                "tools/lint/lint.sh",
+            ],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return next(line for line in self.read("PROGRESS.md").splitlines() if line.startswith("  - acceptance: `tools"))
+
+    def test_fix_task_acceptance_reruns_the_innermost_failed_make_target_of_each_job(self):
+        (self.repo / "Makefile").write_text("all:\n")
+        (self.repo / "svc" / "sim").mkdir(parents=True)
+        (self.repo / "svc" / "sim" / "Makefile").write_text("test:\n")
+        runner = "/home/runner/work/proj/proj"
+        prefix = "tests\tRun the suites\t2026-11-08T12:00:00.0000000Z "
+        log = "".join(
+            prefix + line + "\n"
+            for line in (
+                f"make[1]: Entering directory '{runner}'",
+                f"make[2]: Entering directory '{runner}/svc/sim'",
+                "E   AssertionError: make[9]: *** [Makefile:1: not-a-failure-line]",
+                "make[2]: *** [Makefile:3: test] Error 1",
+                f"make[2]: Leaving directory '{runner}/svc/sim'",
+                "make[1]: *** [Makefile:12: test-all] Error 2",
+                "make: *** [Makefile:4: test-fast] Error 2",
+                "##[error]Process completed with exit code 2.",
+            )
+        )
+        log = "# https://example.invalid/actions/runs/42/job/7\n" + log
+        log += "# https://example.invalid/actions/runs/42/job/8\n"
+        log += "lint\tLint\t2026-11-08T12:00:00.0000000Z make: *** [lint] Error 1\n"
+        self.assertEqual(self.ci_task(log), "  - acceptance: `tools/lint/lint.sh && make -C svc/sim test && make lint`")
+
+    def test_fix_task_acceptance_is_the_configured_command_without_a_failed_make_target(self):
+        log = "# https://example.invalid/actions/runs/42/job/7\n"
+        log += "gate\tTest\t##[error]Process completed with exit code 1.\n"
+        self.assertEqual(self.ci_task(log), "  - acceptance: `tools/lint/lint.sh`")
 
     def test_fix_tasks_are_capped_with_a_question(self):
         fix = (

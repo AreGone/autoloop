@@ -33,7 +33,8 @@ kickoff.sh loop
   │                             MILESTONES.md on autoloop/<next> from the merged base branch with fresh
   │                             PROGRESS.md and QUESTIONS.md; exit 0 after the last one
   │   red check on the PR     -> the failed job log is saved under log/ci-<milestone>-<sha>.log, a task
-  │                             "Make CI green" (ci_task.py) is added with the first error lines, STATUS
+  │                             "Make CI green" (ci_task.py) is added with the first error lines and
+  │                             an acceptance that re-runs the failed make targets, STATUS
   │                             RUNNING, Telegram; task and verify runs handle it, the planning run
   │                             re-runs the acceptance, the loop pushes and watches again; after
   │                             CI_REOPEN_LIMIT such tasks in one milestone: STATUS BLOCKED with a question
@@ -196,7 +197,7 @@ defined.
 | `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request |
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
-| `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails |
+| `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
 | `prompts/judge.md` | the judge's prompt; a project's `prompts/judge.md` replaces it |
 | `hooks/guard.sh` | PreToolUse guard for Bash; sources the project's `hooks/rules.sh` |
 | `autoloop.env.example` | every setting with its default |
