@@ -681,6 +681,42 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         self.assertIn("judge:\n- nothing answered or passed", again.stdout)
 
+    def test_status_report_survives_a_long_backlog_and_is_cut_to_the_limit(self):
+        # A day of failed sends leaves an old stamp and more judge lines than the report shows: the
+        # writer's broken pipe must not empty the report, and the message stays under Telegram's limit.
+        log_dir = self.loop / "log"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "status.last").write_text("1000000000\n")
+        (log_dir / "judge.log").write_text(
+            "".join(f"2026-11-08T10:{i % 60:02d}:00Z Q{i} answered: " + "x" * 600 + "\n" for i in range(400))
+        )
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+        text = subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), "status-text"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("autoloop M1 | RUNNING", text.stdout)
+        self.assertEqual(text.stdout.count(" answered: "), 8)
+        sent = subprocess.run(
+            [str(self.loop / "core" / "telegram.sh"), "status"],
+            cwd=self.repo,
+            env=environ,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        message = sent.stdout.removeprefix("telegram (not configured): ").rstrip("\n")
+        self.assertLessEqual(len(message), 4000)
+        self.assertTrue(message.endswith("(... cut short)"))
+
     def test_status_report_counts_done_tasks_awaiting_verification(self):
         # Two done tasks, one verified and one not, and an open one: done 2, verifying 1.
         verified = (
