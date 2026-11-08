@@ -648,6 +648,10 @@ consider_annotations() {
 # Block until the branch's pull request is merged, closed, or a check fails on its head commit.
 # Checks are read with gh (buckets pass, fail, pending, skipping, cancel) and only when the pull
 # request's head is the local HEAD, so a stale rollup from the previous push is never judged.
+# The head is read again on every pass: a commit pushed after the checks went green (a merge of
+# the base branch, a fix pushed by hand) is judged like the loop's own push. When the pull
+# request's head is ahead of the local HEAD, the branch is fast-forwarded to it first; a head that
+# cannot be fast-forwarded to is left alone and only the merge is waited on.
 # A pull request without any check is only waited on for the merge.
 # Outputs:
 #   On a failed check: one line per failing check, "<bucket> <name> <link>".
@@ -655,9 +659,8 @@ consider_annotations() {
 #   0 merged, 1 closed unmerged, 2 a check failed or was cancelled, 3 withdrawn to consider annotations.
 #######################################
 wait_for_pr() {
-  local branch head state pr_head checks failing green_told=0 empty_polls=0
+  local branch head judged="" state pr_head checks failing green_told=0 empty_polls=0
   branch="$(git rev-parse --abbrev-ref HEAD)"
-  head="$(git rev-parse HEAD)"
   while true; do
     state="$(gh pr view "${branch}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
     case "${state}" in
@@ -665,6 +668,21 @@ wait_for_pr() {
       CLOSED) return 1 ;;
     esac
     pr_head="$(gh pr view "${branch}" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+    head="$(git rev-parse HEAD)"
+    if [[ -n "${pr_head}" && "${pr_head}" != "${head}" ]] \
+      && git fetch -q "${GIT_REMOTE:-origin}" "${branch}" 2>/dev/null \
+      && [[ "$(git rev-parse FETCH_HEAD)" == "${pr_head}" ]] \
+      && git merge-base --is-ancestor HEAD FETCH_HEAD \
+      && git merge -q --ff-only FETCH_HEAD >/dev/null 2>&1; then
+      log "pull request head moved to ${pr_head}; fast-forwarded ${branch} to it" >&2
+      head="${pr_head}"
+    fi
+    if [[ "${head}" != "${judged}" ]]; then
+      # A new head: its checks are judged afresh and green is told again.
+      judged="${head}"
+      green_told=0
+      empty_polls=0
+    fi
     checks=""
     if [[ "${pr_head}" == "${head}" ]]; then
       # gh exits 1 on a failing check and 8 on a pending one; the output is what matters here.
@@ -694,8 +712,8 @@ wait_for_pr() {
         return 3
       fi
       green_told=1
-      log "checks green on ${branch} at ${head}; waiting for the merge"
-      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge."
+      log "checks green on ${branch} at ${head}; waiting for the merge" >&2
+      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge." >&2
     fi
     sleep "${MERGE_POLL_S}"
   done

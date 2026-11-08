@@ -124,12 +124,20 @@ echo '{"is_error": false, "result": "ok"}'
 """
 FAKE_GH = """#!/usr/bin/env bash
 # Scripted gh: the pull request is open at FAKE_HEAD (default: the local HEAD), its one check
-# failed, run 42 has one failed job and a two-line log.
+# failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
+# commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
+# that green is read, as a push from outside the loop would.
 case "$*" in
   *"pr view"*"state"*) echo OPEN ;;
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
   *"pr view"*"url"*) echo "https://example.invalid/pr/1" ;;
-  *"pr checks"*) echo "fail gate https://example.invalid/actions/runs/42/job/7" ;;
+  *"pr checks"*)
+    if [ -n "${FAKE_GREEN_AT:-}" ] && [ "$(git rev-parse HEAD)" = "$FAKE_GREEN_AT" ]; then
+      echo "pass gate https://example.invalid/actions/runs/43/job/8"
+      if [ -n "${FAKE_THEN_COMMIT:-}" ]; then git commit -q --allow-empty -m "pushed after green"; fi
+    else
+      echo "fail gate https://example.invalid/actions/runs/42/job/7"
+    fi ;;
   *"run view 42 --log-failed"*) printf 'gate\\tTest\\t##[error]Process completed with exit code 1.\\n' ;;
   *"run view 42 --json jobs"*) echo gate ;;
   *"actions/runs/42/jobs"*) echo 7 ;;
@@ -721,6 +729,32 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         result = self.call("wait_for_pr", timeout=3, FAKE_HEAD="f" * 40)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_commit_after_green_is_judged_again(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        green = git(self.repo, "rev-parse", "HEAD").strip()
+        result = self.call("wait_for_pr", FAKE_GREEN_AT=green, FAKE_THEN_COMMIT="1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"checks green on autoloop/M1 at {green}", result.stderr)
+        self.assertNotEqual(git(self.repo, "rev-parse", "HEAD").strip(), green)
+
+    def test_push_from_outside_is_fast_forwarded_and_judged(self):
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        remote = self.tmp / "remote.git"
+        git(self.tmp, "init", "-q", "--bare", str(remote))
+        git(self.repo, "remote", "add", "origin", str(remote))
+        git(self.repo, "push", "-q", "origin", "autoloop/M1")
+        other = self.tmp / "other"
+        git(self.tmp, "clone", "-q", "-b", "autoloop/M1", str(remote), str(other))
+        git(other, "commit", "-q", "--allow-empty", "-m", "merge main")
+        git(other, "push", "-q", "origin", "autoloop/M1")
+        pushed = git(other, "rev-parse", "HEAD").strip()
+        result = self.call("wait_for_pr", FAKE_HEAD=pushed)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"pull request head moved to {pushed}", result.stderr)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), pushed)
 
     def test_red_check_reopens_the_milestone_with_a_fix_task(self):
         self.write_progress(DONE_HEADER + TASK + LOG)
