@@ -468,6 +468,43 @@ write_pr_body_full() {
 }
 
 #######################################
+# The HISTORY.md entry of a finished milestone, wrapped at 80 columns with a two-space continuation indent.
+# The bold prefix stays whole on the first line, and no continuation line starts with a word that Markdown
+# would read as markup (a list marker, heading, quote or table): the previous word moves down with it.
+# Arguments:
+#   The date, the milestone id, the title and the archive path.
+#######################################
+history_line() {
+  python3 -I - "$@" <<'PY'
+import re
+import sys
+
+date, milestone, title, path = sys.argv[1:5]
+prefix = f"- **{date}, milestone {milestone} done.**"
+words = [prefix] + f"{title} ({path}).".split()
+markup = re.compile(r"^([-+*#>|<=~`]|\d+[.)])")
+lines = [[words[0]]]
+for word in words[1:]:
+    if len(("  " if len(lines) > 1 else "") + " ".join(lines[-1] + [word])) <= 80:
+        lines[-1].append(word)
+        continue
+    new = [word]
+    moved = []
+    while markup.match(new[0]) and len(lines[-1]) > 1:
+        moved.append(lines[-1].pop())
+        new.insert(0, moved[-1])
+    if len("  " + " ".join(new)) > 80 or markup.match(new[0]):
+        lines[-1].extend(reversed(moved))
+        new = [word]
+    lines.append(new)
+out = []
+for number, line in enumerate(lines):
+    out.append(("  " if number else "") + " ".join(line))
+print("\n".join(out))
+PY
+}
+
+#######################################
 # Archive the working files of the finished milestone under archive/<milestone>/ of the project's
 # autoloop directory, add the milestone's line to HISTORY.md, and commit on the milestone branch
 # (so it is in its pull request). Idempotent: a second call with nothing new to archive commits nothing.
@@ -486,8 +523,11 @@ archive_milestone() {
       > "${dir}/ACCEPTANCE.md" 2>/dev/null || true
   fi
   if ! grep -q "milestone ${milestone} done" "${REPO_ROOT}/HISTORY.md"; then
-    printf -- '- **%s, milestone %s done.** %s (%s/archive/%s).\n' \
-      "$(date -u +%F)" "${milestone}" "$(milestone_title "${milestone}")" "${AUTOLOOP_REL}" "${milestone}" >> "${REPO_ROOT}/HISTORY.md"
+    if [[ -s "${REPO_ROOT}/HISTORY.md" && -n "$(tail -c 1 "${REPO_ROOT}/HISTORY.md")" ]]; then
+      echo >> "${REPO_ROOT}/HISTORY.md"
+    fi
+    history_line "$(date -u +%F)" "${milestone}" "$(milestone_title "${milestone}")" \
+      "${AUTOLOOP_REL}/archive/${milestone}" >> "${REPO_ROOT}/HISTORY.md"
   fi
   git add "${AUTOLOOP_REL}/archive/${milestone}" HISTORY.md
   git diff --cached --quiet || git commit -q -m "Archive ${milestone}: working files, pull request body, acceptance"

@@ -25,7 +25,8 @@ kickoff.sh loop
   │                             replies, records them, sets RUNNING, continues; exit 2 only without
   │                             Telegram or after ANSWER_WAIT_S. Answers and passes: log/judge.log
   ├── STATUS MILESTONE_DONE  -> archive PROGRESS.md, QUESTIONS.md, the pull request body and the
-  │                             acceptance result under archive/<milestone>/ (+ a HISTORY.md line),
+  │                             acceptance result under archive/<milestone>/ (+ a HISTORY.md line,
+  │                             wrapped at 80 columns),
   │                             push the branch, open the pull request (gh), Telegram the URL, watch
   │                             its checks: a red check reopens the milestone (below); green waits
   │                             for the merge, tags it milestone/<id>, then starts the next milestone of

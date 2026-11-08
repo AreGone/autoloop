@@ -148,6 +148,8 @@ PR_FUNCTIONS = ";".join(
         "write_pr_body",
         "write_pr_body_full",
         "milestone_title",
+        "history_line",
+        "archive_milestone",
     )
 )
 
@@ -250,6 +252,90 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
             timeout=timeout + 5,
             check=False,
         )
+
+    # History line
+
+    def history(self, title: str, milestone: str = "M14", date: str = "2026-11-08") -> list[str]:
+        """The lines history_line prints for a title."""
+        result = self.call("history_line", date, milestone, title, f"tools/autoloop/archive/{milestone}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_history_line_wraps_the_m14_entry(self):
+        self.assertEqual(
+            self.history("auth and admin app"),
+            ["- **2026-11-08, milestone M14 done.** auth and admin app", "  (tools/autoloop/archive/M14)."],
+        )
+
+    def test_history_line_short_title_is_one_line(self):
+        self.assertEqual(
+            self.history("first", "M1"), ["- **2026-11-08, milestone M1 done.** first (tools/autoloop/archive/M1)."]
+        )
+
+    def test_history_line_long_title_wraps_at_80(self):
+        title = " ".join(f"word{i:02d}" for i in range(30))[:200]
+        lines = self.history(title)
+        self.assertGreater(len(lines), 2)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertTrue(all(line.startswith("  ") and not line.startswith("   ") for line in lines[1:]))
+        self.assertTrue(lines[0].startswith("- **2026-11-08, milestone M14 done.** "))
+        self.assertEqual(
+            " ".join(" ".join(lines).split()),
+            f"- **2026-11-08, milestone M14 done.** {title} (tools/autoloop/archive/M14).",
+        )
+
+    def test_history_line_continuation_never_starts_with_markup(self):
+        carried = 0
+        for marker in ("-", "#", ">", "1."):
+            for pad in range(40, 43):
+                lines = self.history("x" * pad + f" {marker} tail words")
+                for line in lines[1:]:
+                    self.assertNotRegex(line.lstrip(), r"^([-+*#>|<=~`]|\d+[.)])", (marker, pad, lines))
+                    self.assertLessEqual(len(line), 80, lines)
+                # The marker crossed column 80, so the word before it moved down with it.
+                if lines[1].startswith("  " + "x" * pad + f" {marker}"):
+                    carried += 1
+        self.assertGreaterEqual(carried, 4)
+
+    def test_history_line_markup_carry_never_exceeds_80_columns(self):
+        lines = self.history(" ".join(["-"] * 40))
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+
+    def test_history_line_carry_that_would_overflow_is_undone(self):
+        lines = self.history("- " * 20 + "-" + "x" * 40 + " tail")
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+
+    def test_history_line_carry_stopped_by_a_plain_word_is_undone_by_length(self):
+        # The carry stops on the plain word, so only the length check undoes it.
+        lines = self.history("p" * 41 + " b " + "y" * 60 + " - - -" + "x" * 20)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertEqual(lines[1], "  b " + "y" * 60 + " - -")
+
+    def test_history_line_long_markup_run_does_not_degrade_to_one_word_per_line(self):
+        lines = self.history("aa " + "- " * 60)
+        self.assertTrue(all(len(line) <= 80 for line in lines), lines)
+        self.assertTrue(all(len(line) >= 10 for line in lines[:-1]), lines)
+
+    def test_history_line_empty_title_has_no_double_space(self):
+        lines = self.history("")
+        self.assertEqual(lines, ["- **2026-11-08, milestone M14 done.** (tools/autoloop/archive/M14)."])
+        self.assertNotIn("  ", lines[0])
+
+    def test_archive_milestone_repairs_a_missing_final_newline_and_is_idempotent(self):
+        history = self.repo / "HISTORY.md"
+        history.write_text("# History\n\n- last line")
+        env = {"ARCHIVE_ROOT": str(self.loop / "archive")}
+        self.assertEqual(self.call("archive_milestone", **env).returncode, 0)
+        text = history.read_text()
+        self.assertEqual(text.splitlines()[:3], ["# History", "", "- last line"])
+        self.assertRegex(
+            text.splitlines()[3], r"^- \*\*\d{4}-\d\d-\d\d, milestone M1 done\.\*\* first \(\S+/archive/M1\)\.$"
+        )
+        self.assertEqual(len(text.splitlines()), 4)
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(self.call("archive_milestone", **env).returncode, 0)
+        self.assertEqual(history.read_text(), text)
 
     # Stage choice
 
