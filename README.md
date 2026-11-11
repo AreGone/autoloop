@@ -129,7 +129,9 @@ The judge run answers a question only when the project's documents settle
 it or when it is an engineering choice inside what they allow, and every
 answer names its source: the `Answer:` line reads
 `... (judge, <date>)` and the DECISIONS.md row ends in `(judge)`, so the
-owner can see what was decided for them and overrule it. A question that
+owner can see what was decided for them and overrule it. An answer that
+adds a task also adds its entry to PROGRESS.md, since no other run would
+write it before the milestone closes. A question that
 would change a fixed fact, needs something only the owner has, asks a
 preference, or leaves the judge unsure is passed with a
 `Judge: cannot answer: <why>` line and sent to Telegram with that line in
