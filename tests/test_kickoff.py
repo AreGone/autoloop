@@ -127,9 +127,10 @@ FAKE_GH = """#!/usr/bin/env bash
 # failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
 # commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
 # that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
-# GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the
-# status report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
-# in FAKE_MERGED, exits FAKE_MERGE_RC.
+# GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of
+# FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the status report);
+# #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded in FAKE_MERGED,
+# exits FAKE_MERGE_RC.
 case "$*" in
   *"pr list --app dependabot"*"--jq length"*) echo "${FAKE_PRS_COUNT:-0}" ;;
   *"pr list --app dependabot"*) printf '%s' "${FAKE_PRS:-}" ;;
@@ -1003,9 +1004,7 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         landed = self.land_on_main("lock.txt", "2\n")
         result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.merges(), [f"pr merge 12 --squash --delete-branch --match-head-commit {DEPENDABOT_SHA}"]
-        )
+        self.assertEqual(self.merges(), [f"pr merge 12 --squash --delete-branch --match-head-commit {DEPENDABOT_SHA}"])
         self.assertIn(
             "NOTIFY: autoloop: merged Dependabot pull request #12 (Bump x from 1 to 2) into main: its checks were "
             "green. https://example.invalid/pr/12",
