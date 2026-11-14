@@ -279,7 +279,8 @@ defined.
 
 | File | Role |
 |---|---|
-| `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request, Dependabot's pull requests, the staging |
+| `kickoff.sh` | the loop: settings, stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch; sources `lib/` |
+| `lib/milestone.sh`, `lib/pr.sh`, `lib/dependabot.sh`, `lib/staging.sh` | the milestone's files and pull request; the checks of the pull request and the fix task; Dependabot's pull requests; the staging |
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
 | `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |

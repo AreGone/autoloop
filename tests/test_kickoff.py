@@ -208,29 +208,6 @@ UNSURE = verdict("VERDICT: unsure\nREASON: the log is empty.")
 DEPENDABOT_SHA = "a" * 40
 # One open Dependabot pull request, #12, as the scripted gh lists it.
 DEPENDABOT_PR = f"12|{DEPENDABOT_SHA}|MERGEABLE||false|https://example.invalid/pr/12|Bump x from 1 to 2\n"
-PR_FUNCTIONS = ";".join(
-    f"/^{name}()/,/^}}/p"
-    for name in (
-        "wait_for_pr",
-        "staging_sync",
-        "check_dependabot_prs",
-        "dependabot_red",
-        "dependabot_triage",
-        "dependabot_tell",
-        "merge_base_branch",
-        "reopen_for_ci",
-        "run_annotations",
-        "billing_refused",
-        "run_local_gate",
-        "consider_annotations",
-        "next_question_id",
-        "write_pr_body",
-        "write_pr_body_full",
-        "milestone_title",
-        "history_line",
-        "archive_milestone",
-    )
-)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -252,6 +229,7 @@ class WrapperTest(unittest.TestCase):
         (core / "prompts").mkdir(parents=True)
         for name in CORE_FILES:
             shutil.copy(CORE / name, core / name)
+        shutil.copytree(CORE / "lib", core / "lib")
         for name in ("judge", "dependabot"):
             shutil.copy(CORE / "prompts" / f"{name}.md", core / "prompts" / f"{name}.md")
         (self.loop / "prompts").mkdir()
@@ -390,7 +368,7 @@ class WrapperTest(unittest.TestCase):
         return result.stdout.strip()
 
     def call(self, function: str, *args: str, timeout: int = 20, **env: str) -> subprocess.CompletedProcess:
-        """Runs one pull-request function of kickoff.sh with the fake gh on the PATH, log and notify stubbed.
+        """Runs one function of the core's lib/ files with the fake gh on the PATH, log and notify stubbed.
 
         The judge's triage run is stubbed too: it leaves FAKE_RESULT as its result file, or fails with
         FAKE_INVOKE_RC, and keeps the prompt it was given as log/prompt.
@@ -415,7 +393,7 @@ invoke() {{
   printf '%s' "${{FAKE_RESULT:-}}" > "$LOG_DIR/20261101T000000Z-$1.json"
 }}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
-source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
+for lib in milestone pr dependabot staging; do source "$HERE/lib/$lib.sh"; done
 rc=0
 {function} "$@" || rc=$?
 printf '%s' "${{pr_failing:-}}" > "$LOG_DIR/pr-failing"
