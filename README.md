@@ -283,6 +283,7 @@ defined.
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
 | `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
+| `result.py` | reads a run's JSON result file for the wrapper: its text, the one-line reason, the outcome (ok, usage limit with the reset time, not logged in, error) and a triage run's verdict |
 | `prompts/judge.md` | the judge's prompt; a project's `prompts/judge.md` replaces it |
 | `prompts/dependabot.md` | the judge's prompt for a red pull request of Dependabot; a project's `prompts/dependabot.md` replaces it |
 | `hooks/guard.sh` | PreToolUse guard for Bash; sources the project's `hooks/rules.sh` |

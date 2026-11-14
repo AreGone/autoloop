@@ -19,7 +19,7 @@ import time
 import unittest
 
 CORE = Path(__file__).resolve().parents[1]
-CORE_FILES = ("kickoff.sh", "telegram.sh", "qa.py", "ci_task.py")
+CORE_FILES = ("kickoff.sh", "telegram.sh", "qa.py", "ci_task.py", "result.py")
 # The PROGRESS.md of the project this core is checked out in, when there is one.
 REAL_PROGRESS = CORE.parent.parent.parent / "PROGRESS.md"
 
@@ -685,15 +685,10 @@ exit "$rc"
 
     def test_limit_reset_clock_time_becomes_an_epoch(self):
         # The classifier reads "resets 5:20pm (UTC)" as the next 17:20 UTC, within the coming 24 h.
-        script = CORE / "kickoff.sh"
-        lines = script.read_text().splitlines()
-        start = next(i for i, line in enumerate(lines) if "<<'PY'" in line and "out_file" in line) + 1
-        end = next(i for i in range(start, len(lines)) if lines[i] == "PY")
         out = self.tmp / "limit.json"
         out.write_text('{"is_error": true, "result": "You\u2019ve hit your 5-hour limit \u00b7 resets 5:20pm (UTC)"}')
         verdict = subprocess.run(
-            ["python3", "-I", "-", str(out)],
-            input="\n".join(lines[start:end]),
+            ["python3", "-I", str(CORE / "result.py"), "classify", str(out)],
             capture_output=True,
             text=True,
             check=True,

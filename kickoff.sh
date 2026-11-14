@@ -157,28 +157,13 @@ progress_field() {
 }
 
 #######################################
-# Why a run ended, in one line: the "result" text of its JSON result file with whitespace joined,
+# Why a run ended, in one line: the result text of its result file (result.py) with whitespace joined,
 # cut to RUN_REASON_CHARS characters. Says so when the file is missing or carries no result.
 # Arguments:
 #   The result file (may be empty).
 #######################################
 run_reason() {
-  python3 -I - "$1" "${RUN_REASON_CHARS:-700}" <<'PY'
-import json, sys
-path, limit = sys.argv[1], int(sys.argv[2])
-try:
-    with open(path, encoding="utf-8") as f:
-        text = str(json.load(f).get("result") or "")
-except (OSError, ValueError, AttributeError):
-    text = ""
-text = " ".join(text.split())
-if not text:
-    print("(no result text in the run's result file)")
-elif len(text) > limit:
-    print(text[: limit - 1].rstrip() + "…")
-else:
-    print(text)
-PY
+  python3 -I "${HERE}/result.py" reason "$1" "${RUN_REASON_CHARS:-700}"
 }
 
 #######################################
@@ -342,47 +327,9 @@ invoke() {
     log "stage ${stage} hit the ${STAGE_TIMEOUT_S}s timeout"
     return 1
   fi
-  # Classify from the JSON result (is_error, result text); fall back to rc.
+  # Classify from the JSON result (is_error, result text; result.py); fall back to rc.
   local verdict
-  verdict="$(python3 -I - "${out_file}" <<'PY'
-import json, re, sys, pathlib
-raw = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-try:
-    data = json.loads(raw)
-    if isinstance(data, list):
-        data = next((d for d in reversed(data) if d.get("type") == "result"), data[-1])
-    text = str(data.get("result", "")) + " " + str(data.get("error", ""))
-    is_error = bool(data.get("is_error"))
-except Exception:
-    text, is_error = raw, True
-low = text.lower()
-# Only an error result is classified; a normal summary may mention limits or authentication as its topic.
-if not is_error:
-    print("OK")
-elif re.search(r"(usage limit|hit your \S*\s*limit|rate limit|limit reached|too many requests|overloaded)", low):
-    # The reset time: an epoch after "|" (older wording) or "resets 5:20pm (UTC)" (current wording, a clock
-    # time within the next 24 h). Anything else is 0: the wait falls back to the doubling default.
-    import datetime as dt
-    epoch = "0"
-    m = re.search(r"\|(\d{10})", text)
-    if m:
-        epoch = m.group(1)
-    else:
-        m = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(utc\)", low)
-        if m:
-            hour = int(m.group(1)) % 12 + (12 if m.group(3) == "pm" else 0)
-            now = dt.datetime.now(dt.timezone.utc)
-            reset = now.replace(hour=hour, minute=int(m.group(2) or 0), second=0, microsecond=0)
-            if reset <= now:
-                reset += dt.timedelta(days=1)
-            epoch = str(int(reset.timestamp()))
-    print("LIMIT " + epoch)
-elif re.search(r"(not logged in|invalid api key|authentication_error|please run /login|run claude login|401 unauthorized)", low):
-    print("AUTH")
-else:
-    print("ERROR " + text[:200].replace("\n", " "))
-PY
-)"
+  verdict="$(python3 -I "${HERE}/result.py" classify "${out_file}")"
   case "${verdict}" in
     OK) return 0 ;;
     LIMIT*) LIMIT_RESET_EPOCH="${verdict#LIMIT }"; return 75 ;;
@@ -570,8 +517,7 @@ archive_milestone() {
   write_pr_body "${dir}/PULL_REQUEST.md"
   latest_plan="$(ls -t "${LOG_DIR}"/*-plan.json 2>/dev/null | head -1)"
   if [[ -n "${latest_plan}" ]]; then
-    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",""))' "${latest_plan}" \
-      > "${dir}/ACCEPTANCE.md" 2>/dev/null || true
+    python3 -I "${HERE}/result.py" text "${latest_plan}" > "${dir}/ACCEPTANCE.md" 2>/dev/null || true
   fi
   if ! grep -q "milestone ${milestone} done" "${REPO_ROOT}/HISTORY.md"; then
     if [[ -s "${REPO_ROOT}/HISTORY.md" && -n "$(tail -c 1 "${REPO_ROOT}/HISTORY.md")" ]]; then
@@ -755,7 +701,7 @@ dependabot_tell() {
 # The judge's triage of a red Dependabot pull request. The wrapper saves the failed jobs' log and
 # the pull request's diff under log/ (dependabot-<number>-<sha>.log and .diff); the judge run
 # (JUDGE_MODEL, prompts/dependabot.md with the pull request's facts appended) reads them, changes
-# nothing and ends with a "VERDICT:" and a "REASON:" line, which are read from its result file.
+# nothing and ends with a "VERDICT:" and a "REASON:" line, which are read from its result file (result.py).
 # Arguments:
 #   The pull request number, its head sha, its title, its url, the failing check lines.
 # Outputs:
@@ -787,25 +733,7 @@ dependabot_triage() {
   # The newest result file; the names are timestamps.
   # shellcheck disable=SC2012
   result="$(ls -t "${LOG_DIR}"/*-dependabot.json 2>/dev/null | head -1)"
-  python3 -I - "${result}" <<'PY'
-import json, re, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        data = next((d for d in reversed(data) if d.get("type") == "result"), data[-1])
-    text = str(data.get("result") or "")
-except (OSError, ValueError, AttributeError, IndexError):
-    text = ""
-verdicts = re.findall(r"(?mi)^\W*VERDICT:\W*(flaky|break|unsure)\b", text)
-if not verdicts:
-    sys.exit(1)
-reasons = re.findall(r"(?mi)^\W*REASON:\W*(.+)$", text)
-reason = " ".join(reasons[-1].split()) if reasons else ""
-if len(reason) > 300:
-    reason = reason[:299].rstrip() + "…"
-print(verdicts[-1].lower(), reason or "(no reason given)")
-PY
+  python3 -I "${HERE}/result.py" verdict "${result}"
 }
 
 #######################################
