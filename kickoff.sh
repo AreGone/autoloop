@@ -1200,13 +1200,14 @@ staging_stop() {
 # Dependabot's pull requests are looked at on every poll; when a merge of the base branch moved
 # the head, the branch is pushed and its checks are watched from the start again. The staging
 # follows the head too.
-# Outputs:
-#   On a failed check: one line per failing check, "<bucket> <name> <link>".
+# Globals:
+#   pr_failing: on a failed check, one line per failing check, "<bucket> <name> <link>".
 # Returns:
 #   0 merged, 1 closed unmerged, 2 a check failed or was cancelled, 3 withdrawn to consider annotations.
 #######################################
 wait_for_pr() {
   local branch head judged="" state pr_head checks failing green_told=0 empty_polls=0 local_green=""
+  pr_failing=""
   branch="$(git rev-parse --abbrev-ref HEAD)"
   while true; do
     state="$(gh pr view "${branch}" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
@@ -1230,10 +1231,10 @@ wait_for_pr() {
       && [[ "$(git rev-parse FETCH_HEAD)" == "${pr_head}" ]] \
       && git merge-base --is-ancestor HEAD FETCH_HEAD \
       && git merge -q --ff-only FETCH_HEAD >/dev/null 2>&1; then
-      log "pull request head moved to ${pr_head}; fast-forwarded ${branch} to it" >&2
+      log "pull request head moved to ${pr_head}; fast-forwarded ${branch} to it"
       head="${pr_head}"
     fi
-    staging_sync >&2
+    staging_sync
     if [[ "${head}" != "${judged}" ]]; then
       # A new head: its checks are judged afresh and green is told again.
       judged="${head}"
@@ -1250,13 +1251,13 @@ wait_for_pr() {
       # GitHub did not start the jobs (billing): the local gate stands in for CI on this head.
       if [[ "${local_green}" != "${head}" ]]; then
         local gate_log
-        log "GitHub refused to start CI on ${head} for billing; running the local gate: ${LOCAL_GATE}" >&2
+        log "GitHub refused to start CI on ${head} for billing; running the local gate: ${LOCAL_GATE}"
         if gate_log="$(run_local_gate)"; then
           local_green="${head}"
-          log "local gate green on ${branch} at ${head} (${gate_log}); waiting for the merge" >&2
-          notify "autoloop: GitHub did not start CI on the pull request for $(progress_field MILESTONE) (billing or spending limit); the local gate is green on ${head:0:7} instead. Waiting for the merge." >&2
+          log "local gate green on ${branch} at ${head} (${gate_log}); waiting for the merge"
+          notify "autoloop: GitHub did not start CI on the pull request for $(progress_field MILESTONE) (billing or spending limit); the local gate is green on ${head:0:7} instead. Waiting for the merge."
         else
-          echo "fail local-gate ${gate_log}"
+          pr_failing="fail local-gate ${gate_log}"
           return 2
         fi
       fi
@@ -1264,7 +1265,7 @@ wait_for_pr() {
       continue
     fi
     if [[ -n "${failing}" ]]; then
-      echo "${failing}"
+      pr_failing="${failing}"
       return 2
     fi
     if [[ -z "${checks}" ]]; then
@@ -1286,8 +1287,8 @@ wait_for_pr() {
         return 3
       fi
       green_told=1
-      log "checks green on ${branch} at ${head}; waiting for the merge" >&2
-      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge." >&2
+      log "checks green on ${branch} at ${head}; waiting for the merge"
+      notify "autoloop: CI is green on the pull request for $(progress_field MILESTONE); waiting for the merge."
     fi
     sleep "${MERGE_POLL_S}"
   done
@@ -1473,7 +1474,7 @@ main() {
         notify "autoloop: still BLOCKED and cannot wait for an answer; see QUESTIONS.md and kickoff.log"
         exit 2 ;;
       milestone_done)
-        local done_ms next_ms pr_url failing
+        local done_ms next_ms pr_url
         done_ms="$(progress_field MILESTONE)"
         log "milestone ${done_ms} done"
         if ! command -v gh >/dev/null 2>&1; then
@@ -1484,14 +1485,14 @@ main() {
         pr_url="$(open_pr)" || { notify "autoloop: milestone ${done_ms} DONE but the push or pull request failed; see kickoff.log"; exit 3; }
         notify "autoloop: milestone ${done_ms} DONE. Pull request: ${pr_url}. The loop watches its checks and waits for the merge, then starts the next milestone."
         rc=0
-        failing="$(wait_for_pr)" || rc=$?
+        wait_for_pr || rc=$?
         case "${rc}" in
           1)
             notify "autoloop: the pull request for ${done_ms} was closed without merging; stopped. Reopen or merge it and restart."
             exit 2 ;;
           2)
-            log "check failed on the ${done_ms} pull request: ${failing}"
-            reopen_for_ci "${failing}"
+            log "check failed on the ${done_ms} pull request: ${pr_failing}"
+            reopen_for_ci "${pr_failing}"
             continue ;;
           3)
             notify "autoloop: CI is green on the pull request for ${done_ms} but carries warning annotations; the milestone is reopened so the planning run considers them. $(tail -1 "${PROGRESS}" | cut -c1-300)"

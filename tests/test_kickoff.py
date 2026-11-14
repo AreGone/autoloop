@@ -416,7 +416,10 @@ invoke() {{
 }}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
 source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
-{function} "$@"
+rc=0
+{function} "$@" || rc=$?
+printf '%s' "${{pr_failing:-}}" > "$LOG_DIR/pr-failing"
+exit "$rc"
 """
         environ = {**os.environ, **IDENTITY, "FAKE_MERGED": str(self.merged), "FAKE_RERUN": str(self.rerun), **env}
         environ["PATH"] = f"{self.bin}:{os.environ['PATH']}"
@@ -429,6 +432,11 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
             timeout=timeout + 5,
             check=False,
         )
+
+    def failing(self) -> str:
+        """The failing check lines wait_for_pr left in pr_failing on its last call through the harness."""
+        path = self.tmp / "log" / "pr-failing"
+        return path.read_text().strip() if path.exists() else ""
 
     # History line
 
@@ -918,17 +926,17 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.write_progress(DONE_HEADER + TASK + LOG)
         result = self.call("wait_for_pr")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertEqual(self.failing(), "fail gate https://example.invalid/actions/runs/42/job/7")
 
     def test_billing_refusal_runs_the_local_gate_and_waits_for_the_merge_when_green(self):
         self.write_progress(DONE_HEADER + TASK + LOG)
         marker = self.tmp / "gate-ran"
         result = self.call("wait_for_pr", timeout=4, FAKE_BILLING="1", LOCAL_GATE=f"echo x >> {marker}")
         self.assertEqual(result.returncode, 124, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr.count("NOTIFY:"), 1, result.stderr)
-        self.assertIn("the local gate is green", result.stderr)
-        self.assertIn("refused to start CI", result.stderr)
+        self.assertEqual(self.failing(), "")
+        self.assertEqual(result.stdout.count("NOTIFY:"), 1, result.stdout)
+        self.assertIn("the local gate is green", result.stdout)
+        self.assertIn("refused to start CI", result.stdout)
         # Once per head, not on every poll.
         self.assertEqual(marker.read_text(), "x\n")
 
@@ -941,8 +949,8 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         gate_log = self.tmp / "log" / f"local-gate-{sha}.log"
-        self.assertEqual(result.stdout.strip(), f"fail local-gate {gate_log}")
-        reopened = self.call("reopen_for_ci", result.stdout.strip())
+        self.assertEqual(self.failing(), f"fail local-gate {gate_log}")
+        reopened = self.call("reopen_for_ci", self.failing())
         self.assertEqual(reopened.returncode, 0, reopened.stderr)
         progress = self.read("PROGRESS.md")
         self.assertIn(f"- [ ] T1.2 Make CI green on the pull request: check local-gate failed on {sha}", progress)
@@ -960,15 +968,16 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.write_progress(DONE_HEADER + TASK + LOG)
         result = self.call("wait_for_pr", timeout=3, FAKE_HEAD="f" * 40)
         self.assertEqual(result.returncode, 124, result.stderr)
-        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.failing(), "")
+        self.assertNotIn("checks green", result.stdout)
 
     def test_commit_after_green_is_judged_again(self):
         self.write_progress(DONE_HEADER + TASK + LOG)
         green = git(self.repo, "rev-parse", "HEAD").strip()
         result = self.call("wait_for_pr", FAKE_GREEN_AT=green, FAKE_THEN_COMMIT="1")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
-        self.assertIn(f"checks green on autoloop/M1 at {green}", result.stderr)
+        self.assertEqual(self.failing(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"checks green on autoloop/M1 at {green}", result.stdout)
         self.assertNotEqual(git(self.repo, "rev-parse", "HEAD").strip(), green)
 
     def test_push_from_outside_is_fast_forwarded_and_judged(self):
@@ -984,8 +993,8 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         pushed = git(other, "rev-parse", "HEAD").strip()
         result = self.call("wait_for_pr", FAKE_HEAD=pushed)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout.strip(), "fail gate https://example.invalid/actions/runs/42/job/7")
-        self.assertIn(f"pull request head moved to {pushed}", result.stderr)
+        self.assertEqual(self.failing(), "fail gate https://example.invalid/actions/runs/42/job/7")
+        self.assertIn(f"pull request head moved to {pushed}", result.stdout)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD").strip(), pushed)
 
     def test_red_check_reopens_the_milestone_with_a_fix_task(self):
