@@ -139,6 +139,8 @@ run_local_gate() {
 # Returns:
 #   0 merged, 1 closed unmerged, 2 a check failed or was cancelled, 3 withdrawn to consider annotations.
 #######################################
+# pr_failing is read by kickoff.sh after the call.
+# shellcheck disable=SC2034
 wait_for_pr() {
   local branch head judged="" state pr_head checks failing green_told=0 empty_polls=0 local_green=""
   pr_failing=""

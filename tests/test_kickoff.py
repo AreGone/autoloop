@@ -131,8 +131,9 @@ FAKE_GH = """#!/usr/bin/env bash
 # failed, run 42 has one failed job and a two-line log. With FAKE_GREEN_AT the check passed on that
 # commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
 # that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
-# GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the
-# status report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
+# GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of
+# FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the status
+# report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
 # in FAKE_MERGED, exits FAKE_MERGE_RC. Run 43 (the checks of #12) has a one-line failed log; a re-run
 # of its failed jobs is recorded in FAKE_RERUN and exits FAKE_RERUN_RC.
 case "$*" in
@@ -1420,7 +1421,9 @@ exit "$rc"
     def test_staging_runs_on_free_ports_follows_commits_and_stops_with_the_loop(self):
         # A STAGING_UP that keeps running (two dev servers): started with the loop, started again after each
         # of the first two commits (the third ends the loop), told once, stopped with the loop.
-        fake = FAKE_COMMIT.replace('echo x >> "$FAKE_COUNT"\n', 'echo x >> "$FAKE_COUNT"\necho "$STAGING_PORT_WEB" > "$FAKE_SEEN"\n')
+        fake = FAKE_COMMIT.replace(
+            'echo x >> "$FAKE_COUNT"\n', 'echo x >> "$FAKE_COUNT"\necho "$STAGING_PORT_WEB" > "$FAKE_SEEN"\n'
+        )
         env = self.staging_env(61100, FAKE_SEEN=str(self.tmp / "seen"))
         result = self.run_loop(fake, MAX_ITERATIONS="3", STAGING_UP=STAGING_SERVE, STAGING_SERVICES="web api", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1449,12 +1452,16 @@ exit "$rc"
 
     def test_staging_tells_when_up_fails_and_a_service_stops_answering(self):
         env = self.staging_env(61200)
-        result = self.run_loop(FAKE_COMMIT, MAX_ITERATIONS="2", STAGING_UP=STAGING_FAIL_SECOND, STAGING_SERVICES="web", **env)
+        result = self.run_loop(
+            FAKE_COMMIT, MAX_ITERATIONS="2", STAGING_UP=STAGING_FAIL_SECOND, STAGING_SERVICES="web", **env
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         port = self.ports()["web"]
         start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
         after = git(self.repo, "rev-parse", "HEAD~1").strip()[:7]
-        self.assertIn(f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout)
+        self.assertIn(
+            f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout
+        )
         self.assertIn(
             f"telegram (not configured): autoloop: staging at {after}: STAGING_UP exited 7 (compose: boom); "
             f"web http://stage.invalid:{port} (not answering).",
@@ -1509,7 +1516,9 @@ exit "$rc"
         self.assertEqual(result.returncode, 0, result.stderr)
         port = self.ports()["web"]
         start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
-        self.assertIn(f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout)
+        self.assertIn(
+            f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout
+        )
         self.assertNotIn("not answering", result.stdout)
         self.assertEqual(self.staging_lines(), ["up", "up"])
         self.assertEqual(result.stdout.count("staging refreshed at "), 1)
@@ -1517,7 +1526,9 @@ exit "$rc"
 
     def test_dry_run_starts_no_staging(self):
         env = self.staging_env(61600)
-        result = self.run_loop(FAKE_COMMIT, "--dry-run", STAGING_UP='echo up >> "$FAKE_STAGING"', STAGING_SERVICES="web", **env)
+        result = self.run_loop(
+            FAKE_COMMIT, "--dry-run", STAGING_UP='echo up >> "$FAKE_STAGING"', STAGING_SERVICES="web", **env
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('dry-run: would start the staging (echo up >> "$FAKE_STAGING") for web', result.stdout)
         self.assertEqual(self.staging_lines(), [])
@@ -1542,7 +1553,9 @@ exit "$rc"
             result = self.telegram("status-text", STAGING_HOST="stage.invalid")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(
-            result.stdout.endswith("staging: web http://stage.invalid:61700 (up), api http://stage.invalid:61701 (down)\n"),
+            result.stdout.endswith(
+                "staging: web http://stage.invalid:61700 (up), api http://stage.invalid:61701 (down)\n"
+            ),
             result.stdout,
         )
 

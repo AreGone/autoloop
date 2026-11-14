@@ -291,7 +291,8 @@ defined.
 | `hooks/guard.sh` | PreToolUse guard for Bash; sources the project's `hooks/rules.sh` |
 | `autoloop.env.example` | every setting with its default |
 | `service/` | systemd unit templates, the hourly status timer and `install.sh` (install, disable, uninstall, status) |
-| `tests/` | the wrapper's tests: `python3 -I -m unittest discover -s tools/autoloop/core/tests` (git, bash and a fake claude; no network) |
+| `tests/` | the wrapper's tests: `python3 -I -m unittest discover -s tools/autoloop/core/tests` (git, Linux bash and a fake claude; no network) |
+| `Makefile`, `pyproject.toml`, `.github/workflows/test.yml` | the core's own checks: `make lint` (shellcheck, ruff), `make test`, `make test-docker` (the suite in a Linux container, for a Mac); CI runs lint and the suite on every push |
 
 ## What the human does
 

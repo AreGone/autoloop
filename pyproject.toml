@@ -1,0 +1,11 @@
+# The core's own ruff settings; an adopting project's ruff finds this file for the core's files.
+# The Python floor is 3.10 (the loop's hosts), so ruff does not ask for 3.11 spellings.
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "E501", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true

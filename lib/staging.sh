@@ -128,13 +128,13 @@ process_start() {
 # started; a pid that now belongs to another process is only forgotten.
 #######################################
 staging_kill_up() {
-  local pid started i
+  local pid started
   read -r pid started < "${STAGING_PID}" 2>/dev/null || return 0
   rm -f "${STAGING_PID}"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null || return 0
   [[ "$(process_start "${pid}")" == "${started:-}" ]] || return 0
   kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
-  for i in {1..10}; do
+  for _ in {1..10}; do
     kill -0 "${pid}" 2>/dev/null || return 0
     sleep 1
   done
@@ -194,6 +194,8 @@ staging_up() {
 #######################################
 staging_start() {
   [[ -n "${STAGING_UP}" ]] || return 0
+  # dry_run is set by kickoff.sh from its arguments.
+  # shellcheck disable=SC2154
   if (( dry_run )); then
     log "dry-run: would start the staging (${STAGING_UP}) for ${STAGING_SERVICES:-no declared service}"
     return 0

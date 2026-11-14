@@ -1,0 +1,13 @@
+# The core's own checks on every push and pull request: lint (shellcheck, ruff) and the suite, in the
+# container the Makefile names for running the suite by hand (Linux bash, git and timeout; no network).
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && apt-get install -y -qq shellcheck && pip install -q ruff
+      - run: make lint
+      - run: make test

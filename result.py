@@ -24,7 +24,9 @@ import re
 import sys
 
 LIMIT_RE = re.compile(r"(usage limit|hit your \S*\s*limit|rate limit|limit reached|too many requests|overloaded)")
-AUTH_RE = re.compile(r"(not logged in|invalid api key|authentication_error|please run /login|run claude login|401 unauthorized)")
+AUTH_RE = re.compile(
+    r"(not logged in|invalid api key|authentication_error|please run /login|run claude login|401 unauthorized)"
+)
 VERDICT_RE = re.compile(r"(?mi)^\W*VERDICT:\W*(flaky|break|unsure)\b")
 REASON_RE = re.compile(r"(?mi)^\W*REASON:\W*(.+)$")
 
