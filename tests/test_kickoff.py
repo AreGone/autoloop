@@ -19,7 +19,7 @@ import time
 import unittest
 
 CORE = Path(__file__).resolve().parents[1]
-CORE_FILES = ("kickoff.sh", "telegram.sh", "qa.py", "ci_task.py", "result.py")
+CORE_FILES = ("kickoff.sh", "telegram.sh", "qa.py", "ci_task.py", "result.py", "progress.py")
 # The PROGRESS.md of the project this core is checked out in, when there is one.
 REAL_PROGRESS = CORE.parent.parent.parent / "PROGRESS.md"
 
@@ -548,6 +548,20 @@ exit "$rc"
 
     def test_orphan_under_blocked_still_blocked(self):
         self.assertEqual(self.stage(BLOCKED_HEADER + TASK + "  - files: again\n" + LOG), "blocked")
+
+    def test_progress_reader_names_the_orphan_line(self):
+        # The line number and text go into the log and the Telegram message that ask for the repair.
+        text = HEADER + TASK + "  - files: again\n" + LOG
+        self.write_progress(text)
+        line = text.splitlines().index("  - files: again") + 1
+        result = subprocess.run(
+            ["python3", "-I", str(CORE / "progress.py"), str(self.repo / "PROGRESS.md"), "orphan"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        self.assertEqual(result.stdout, f"{line}:   - files: again\n")
 
     def test_real_progress_has_no_orphan(self):
         if not REAL_PROGRESS.exists():

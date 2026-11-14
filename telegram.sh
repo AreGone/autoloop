@@ -77,7 +77,7 @@ send_file() {
 }
 
 #######################################
-# Build the progress summary from PROGRESS.md, git log and the judge log: everything since the
+# Build the progress summary from PROGRESS.md (read by progress.py), git log and the judge log: everything since the
 # last report (at most the last hour when there was none), the open Dependabot pull requests
 # when gh can list them, and the staging's services (kickoff.sh writes log/staging.ports) with
 # whether each accepts a connection on loopback.
@@ -85,14 +85,10 @@ send_file() {
 status_text() {
   cd "${REPO_ROOT}"
   local status milestone open prog done_ verifying reopened branch commits since judge dependabot="" staging=""
-  status="$(sed -n 's/^STATUS: *//p' PROGRESS.md | head -1)"
-  milestone="$(sed -n 's/^MILESTONE: *//p' PROGRESS.md | head -1)"
-  open="$(grep -cE '^- \[ \] T' PROGRESS.md || true)"
-  prog="$(grep -cE '^- \[~\] T' PROGRESS.md || true)"
-  done_="$(grep -cE '^- \[x\] T' PROGRESS.md || true)"
-  reopened="$(grep -cE '^- \[!\] T' PROGRESS.md || true)"
-  # Done tasks whose verified: field is still empty: the verify run is pending or running on them.
-  verifying="$(awk '/^- \[x\] T/{t=1} /^- \[/{if(!/^- \[x\]/){t=0}} t && /^  - verified: *$/{n++} END{print n+0}' PROGRESS.md)"
+  status="$(python3 -I "${HERE}/progress.py" PROGRESS.md field STATUS)"
+  milestone="$(python3 -I "${HERE}/progress.py" PROGRESS.md field MILESTONE)"
+  # The tasks by state, and the done ones whose verified: field is still empty (the verify run is pending on them).
+  read -r open prog reopened done_ verifying <<< "$(python3 -I "${HERE}/progress.py" PROGRESS.md counts)"
   branch="$(git rev-parse --abbrev-ref HEAD)"
   since="$(cat "${STATUS_STAMP}" 2>/dev/null || true)"
   [[ "${since}" =~ ^[0-9]+$ ]] || since=$(( $(date -u +%s) - 3600 ))

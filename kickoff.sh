@@ -148,12 +148,12 @@ prompt_file() {
 }
 
 #######################################
-# Read a header field of PROGRESS.md (STATUS, MILESTONE).
+# Read a header field of PROGRESS.md (STATUS, MILESTONE), through progress.py like every other reading of it.
 # Arguments:
 #   The field name.
 #######################################
 progress_field() {
-  sed -n "s/^$1: *//p" "${PROGRESS}" | head -1 | tr -d '[:space:]'
+  python3 -I "${HERE}/progress.py" "${PROGRESS}" field "$1"
 }
 
 #######################################
@@ -175,32 +175,12 @@ next_question_id() {
 }
 
 #######################################
-# Count task lines in a given checkbox state.
-# Arguments:
-#   The state character inside the brackets: ' ', '~', 'x', '!'.
-#######################################
-count_tasks() {
-  grep -cE "^- \[$1\] T" "${PROGRESS}" || true
-}
-
-#######################################
 # Find a task field outside a task: before any task, or repeated within one (a lost task heading).
-# Only lines of exactly two spaces and "- field:" count; continuation lines and the Log never match.
 # Outputs:
 #   The first orphan's line number and first 60 characters; nothing when there is none.
 #######################################
 orphan_field() {
-  awk '
-    /^## Log/ { exit }
-    /^- \[.\] T/ { intask = 1; split("", seen); next }
-    /^  - (files|reads|design|acceptance|model|notes|verified):/ {
-      name = $0
-      sub(/^  - /, "", name)
-      sub(/:.*/, "", name)
-      if (!intask || (name in seen)) { print NR ": " substr($0, 1, 60); exit }
-      seen[name] = 1
-    }
-  ' "${PROGRESS}"
+  python3 -I "${HERE}/progress.py" "${PROGRESS}" orphan
 }
 
 #######################################
@@ -226,36 +206,12 @@ repair_progress() {
 }
 
 #######################################
-# Decide the next stage from PROGRESS.md: plan, task, verify, or a terminal state.
+# Decide the next stage from PROGRESS.md: plan, task, verify, or a terminal state (progress.py).
 # Outputs:
 #   One word on stdout.
 #######################################
 next_stage() {
-  local state open prog done_ reopened
-  state="$(progress_field STATUS)"
-  case "${state}" in
-    BLOCKED) echo "blocked"; return ;;
-    MILESTONE_DONE) echo "milestone_done"; return ;;
-    RUNNING) ;;
-    *) echo "bad_status"; return ;;
-  esac
-  if [[ -n "$(orphan_field)" ]]; then
-    echo "bad_progress"
-    return
-  fi
-  open="$(count_tasks ' ')"
-  prog="$(count_tasks '~')"
-  done_="$(count_tasks 'x')"
-  reopened="$(count_tasks '!')"
-  if (( open + prog + done_ + reopened == 0 )); then
-    echo "plan"
-  elif grep -qE '^- \[x\] T' "${PROGRESS}" && awk '/^- \[x\] T/{t=1; v=0} /^- \[/{if(!/^- \[x\]/){t=0}} t && /^  - verified: *[^ ]/{v=1} t && /^  - verified: *$/{print "unverified"; exit}' "${PROGRESS}" | grep -q unverified; then
-    echo "verify"
-  elif (( open + prog + reopened > 0 )); then
-    echo "task"
-  else
-    echo "plan"   # everything done and verified: the planning run runs the milestone acceptance
-  fi
+  python3 -I "${HERE}/progress.py" "${PROGRESS}" stage
 }
 
 #######################################
@@ -267,32 +223,7 @@ next_stage() {
 #######################################
 task_model() {
   local picked
-  picked="$(python3 -I - "${PROGRESS}" <<'PY'
-import re
-import sys
-
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-
-
-def first(mark: str):
-    for i, line in enumerate(lines):
-        if line.startswith(f"- [{mark}] T"):
-            return i
-    return None
-
-
-start = next((j for j in (first("~"), first("!"), first(" ")) if j is not None), None)
-model = ""
-if start is not None:
-    for line in lines[start + 1:]:
-        if line.startswith("- ["):
-            break
-        m = re.match(r"\s+- model:\s*(\S+)\s*$", line)
-        if m:
-            model = m.group(1)
-print(model)
-PY
-)"
+  picked="$(python3 -I "${HERE}/progress.py" "${PROGRESS}" task-model)"
   echo "${picked:-${TASK_MODEL}}"
 }
 
