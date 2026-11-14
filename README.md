@@ -62,8 +62,11 @@ orphan field -> a task field outside a task or repeated within one. Left by the 
 Dependabot   -> its pull requests on the base branch are looked at before every run and on every poll while
                 a milestone's pull request waits: a green, mergeable one is merged (DEPENDABOT_MERGE: squash
                 by default; report only tells the owner) and the base branch merged into the milestone branch,
-                pushed when the milestone's pull request is open; a red one, one the merge failed on, and a
-                base branch that conflicts are told to the owner once and left; one still being checked waits
+                pushed when the milestone's pull request is open; a red one goes to the judge once per head
+                commit (DEPENDABOT_TRIAGE=judge, prompts/dependabot.md): flaky has its failed jobs run again
+                once, broken or unclear is told to the owner with the judge's reason, and it is never merged
+                while red; one the merge failed on and a base branch that conflicts are told to the owner
+                once and left; one still being checked waits
 telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, and gh
 ```
 
@@ -76,7 +79,7 @@ telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log 
   telegram.sh           exec "$(dirname "$0")/core/telegram.sh" "$@"   (the prompts name this path)
   hooks/guard.sh        exec "$(dirname "$0")/../core/hooks/guard.sh"  (named in .claude/settings.json)
   hooks/rules.sh        optional: the project's own guard rules, sourced by the shared guard
-  prompts/plan.md, task.md, verify.md   the project's master prompts (judge.md optional; core's is the default)
+  prompts/plan.md, task.md, verify.md   the project's master prompts (judge.md and dependabot.md optional; core's are the default)
   autoloop.env.example  the settings the project changes; autoloop.env (git-ignored) holds the real values
   log/                  git-ignored: one JSON result per run, kickoff.log, judge.log, the CI logs, evidence
   archive/<milestone>/  committed: each finished milestone's PROGRESS.md, QUESTIONS.md, pull request body, acceptance
@@ -139,6 +142,22 @@ to `log/judge.log`, reconciles `STATUS` with the file, and reports to
 Telegram at once. A judge run that changes nothing sends the questions to
 the owner; the judge is never asked twice about the same set in one run of
 the wrapper.
+
+The judge also triages a red pull request of Dependabot, once per head
+commit (`DEPENDABOT_TRIAGE=judge`, the default; `off` only tells the owner).
+The wrapper saves the failed jobs' log and the pull request's diff under
+`log/` (`dependabot-<number>-<sha>.log` and `.diff`) and appends the pull
+request's facts to `prompts/dependabot.md`; the run changes nothing and ends
+with a `VERDICT:` line (`flaky`, `break` or `unsure`) and a `REASON:` line,
+which the wrapper reads from the run's result file. `flaky` has the failed
+jobs run again once (`gh run rerun --failed`): green is then merged like any
+other, red again is told to the owner. `break` and `unsure` are told to the
+owner with the reason, as is a run that names no verdict. The judge never
+merges, fixes or closes anything, and the log and the diff, which come from
+outside the repository, can move it to nothing more than that one re-run.
+Checks GitHub refused to start for billing are told to the owner without a
+judge run. Each verdict is a line in `log/judge.log`, so the hourly report
+carries it.
 
 The hourly status report (`telegram.sh status`, fired by the
 `<name>-status.timer` unit) carries the milestone, the task counts (open,
@@ -211,6 +230,7 @@ defined.
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
 | `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
 | `prompts/judge.md` | the judge's prompt; a project's `prompts/judge.md` replaces it |
+| `prompts/dependabot.md` | the judge's prompt for a red pull request of Dependabot; a project's `prompts/dependabot.md` replaces it |
 | `hooks/guard.sh` | PreToolUse guard for Bash; sources the project's `hooks/rules.sh` |
 | `autoloop.env.example` | every setting with its default |
 | `service/` | systemd unit templates, the hourly status timer and `install.sh` (install, disable, uninstall, status) |
@@ -231,9 +251,11 @@ request unmerged stops the loop. Dependabot's pull requests are the loop's
 too: one whose checks are green is merged for you (`DEPENDABOT_MERGE`,
 squash by default; `report` leaves the merge to you, `ignore` leaves them
 all alone) and the base branch is merged into the milestone branch; one
-whose check is red, one the loop could not merge (a required review, a
-forbidden merge method) and a base branch that no longer merges cleanly are
-told to you once and left alone. Keep `MILESTONES.md` honest when the plan
+whose check is red goes to the judge first, which has a flaky check run
+again once and tells you, with its reason, about an update that breaks the
+build or that it cannot call; that one, one the loop could not merge (a
+required review, a forbidden merge method) and a base branch that no longer
+merges cleanly are told to you once and left alone. Keep `MILESTONES.md` honest when the plan
 changes. The loop's prompts do not push; the wrapper pushes the milestone
 branch when the milestone is done, and again when the base branch was
 merged into it while its pull request waits.

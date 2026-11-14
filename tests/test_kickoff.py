@@ -6,6 +6,7 @@ Needs git, bash, python3 and the `timeout` binary; claude is a fake script, Tele
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -129,12 +130,16 @@ FAKE_GH = """#!/usr/bin/env bash
 # that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
 # GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the
 # status report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
-# in FAKE_MERGED, exits FAKE_MERGE_RC.
+# in FAKE_MERGED, exits FAKE_MERGE_RC. Run 43 (the checks of #12) has a one-line failed log; a re-run
+# of its failed jobs is recorded in FAKE_RERUN and exits FAKE_RERUN_RC.
 case "$*" in
   *"pr list --app dependabot"*"--jq length"*) echo "${FAKE_PRS_COUNT:-0}" ;;
   *"pr list --app dependabot"*) printf '%s' "${FAKE_PRS:-}" ;;
   *"pr checks 12 "*) printf '%s\\n' "${FAKE_PR_CHECKS-pass gate https://example.invalid/actions/runs/43/job/8}" ;;
   *"pr merge 12 "*) echo "$*" >> "${FAKE_MERGED:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}" ;;
+  *"pr diff 12"*) printf -- '-x==1\n+x==2\n' ;;
+  *"run view 43 --log-failed"*) printf 'gate\tInstall\tnpm ERR! 503 Service Unavailable\n' ;;
+  *"run rerun "*) echo "$*" >> "${FAKE_RERUN:-/dev/null}"; exit "${FAKE_RERUN_RC:-0}" ;;
   *"pr view"*"state"*) echo OPEN ;;
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
   *"pr view"*"url"*) echo "https://example.invalid/pr/1" ;;
@@ -158,6 +163,28 @@ case "$*" in
   *) exit 1 ;;
 esac
 """
+# The triage run ends with a verdict (its prompt ends with the pull request's facts); any other run commits.
+FAKE_TRIAGE_FLAKY = """#!/usr/bin/env bash
+echo x >> "$FAKE_COUNT"
+case "$*" in
+  *"The pull request: #12"*)
+    echo '{"is_error": false, "result": "Read both.\\n\\nVERDICT: flaky\\nREASON: the registry answered 503."}' ;;
+  *)
+    git commit -q --allow-empty -m "fake work"
+    echo '{"is_error": false, "result": "ok"}' ;;
+esac
+"""
+RED_CHECK = "fail gate https://example.invalid/actions/runs/43/job/8"
+
+
+def verdict(text: str) -> str:
+    """The result file of a triage run whose answer is the text."""
+    return json.dumps({"is_error": False, "result": text})
+
+
+FLAKY = verdict("I read the log.\n\nVERDICT: flaky\nREASON: npm answered 503 in step Install;\n")
+BREAK = verdict("**VERDICT:** break\n**REASON:** tests/test_x.py fails on the removed x.old() call.")
+UNSURE = verdict("VERDICT: unsure\nREASON: the log is empty.")
 DEPENDABOT_SHA = "a" * 40
 # One open Dependabot pull request, #12, as the scripted gh lists it.
 DEPENDABOT_PR = f"12|{DEPENDABOT_SHA}|MERGEABLE||false|https://example.invalid/pr/12|Bump x from 1 to 2\n"
@@ -166,6 +193,8 @@ PR_FUNCTIONS = ";".join(
     for name in (
         "wait_for_pr",
         "check_dependabot_prs",
+        "dependabot_red",
+        "dependabot_triage",
         "dependabot_tell",
         "merge_base_branch",
         "reopen_for_ci",
@@ -202,7 +231,8 @@ class WrapperTest(unittest.TestCase):
         (core / "prompts").mkdir(parents=True)
         for name in CORE_FILES:
             shutil.copy(CORE / name, core / name)
-        shutil.copy(CORE / "prompts" / "judge.md", core / "prompts" / "judge.md")
+        for name in ("judge", "dependabot"):
+            shutil.copy(CORE / "prompts" / f"{name}.md", core / "prompts" / f"{name}.md")
         (self.loop / "prompts").mkdir()
         for name in ("plan", "task", "verify"):
             (self.loop / "prompts" / f"{name}.md").write_text(f"{name} prompt\n")
@@ -220,6 +250,7 @@ class WrapperTest(unittest.TestCase):
         (self.bin / "gh").write_text(FAKE_GH)
         (self.bin / "gh").chmod(0o755)
         self.merged = self.tmp / "merged"
+        self.rerun = self.tmp / "rerun"
 
     def add_remote(self) -> Path:
         """Gives the repository a bare origin holding main, at the initial commit, and the milestone branch."""
@@ -256,7 +287,7 @@ class WrapperTest(unittest.TestCase):
         environ = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
         environ.update(IDENTITY)
         environ.update({"FAKE_FORGET_STATUS": "", **env}, CLAUDE_BIN=str(claude), FAKE_COUNT=str(self.tmp / "count"))
-        environ.update(PATH=f"{self.bin}:{environ['PATH']}", FAKE_MERGED=str(self.merged))
+        environ.update(PATH=f"{self.bin}:{environ['PATH']}", FAKE_MERGED=str(self.merged), FAKE_RERUN=str(self.rerun))
         return subprocess.run(
             [str(self.loop / "core" / "kickoff.sh"), *args],
             cwd=self.repo,
@@ -294,7 +325,11 @@ class WrapperTest(unittest.TestCase):
         return result.stdout.strip()
 
     def call(self, function: str, *args: str, timeout: int = 20, **env: str) -> subprocess.CompletedProcess:
-        """Runs one pull-request function of kickoff.sh with the fake gh on the PATH, log and notify stubbed."""
+        """Runs one pull-request function of kickoff.sh with the fake gh on the PATH, log and notify stubbed.
+
+        The judge's triage run is stubbed too: it leaves FAKE_RESULT as its result file, or fails with
+        FAKE_INVOKE_RC, and keeps the prompt it was given as log/prompt.
+        """
         log_dir = self.tmp / "log"
         log_dir.mkdir(exist_ok=True)
         script = f"""set -uo pipefail
@@ -304,13 +339,21 @@ PROGRESS={self.repo}/PROGRESS.md; QUESTIONS={self.repo}/QUESTIONS.md
 MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_ACCEPTANCE=tools/lint/lint.sh
 LOCAL_GATE="${{LOCAL_GATE:-true}}"; LOCAL_GATE_TIMEOUT_S=60
 GIT_REMOTE=origin; BASE_BRANCH=main; DEPENDABOT_MERGE=${{DEPENDABOT_MERGE:-squash}}
+DEPENDABOT_TRIAGE=${{DEPENDABOT_TRIAGE:-judge}}; JUDGE_MODEL=opus; JUDGE_MAX_TURNS=40; JUDGE_LOG={log_dir}/judge.log
 log() {{ echo "LOG: $*"; }}
 notify() {{ echo "NOTIFY: $*"; }}
+prompt_file() {{ echo "$HERE/prompts/$1.md"; }}
+invoke() {{
+  echo "INVOKE: $1 $2 $4"
+  cp "$3" "$LOG_DIR/prompt"
+  [[ -z "${{FAKE_INVOKE_RC:-}}" ]] || return "$FAKE_INVOKE_RC"
+  printf '%s' "${{FAKE_RESULT:-}}" > "$LOG_DIR/20261101T000000Z-$1.json"
+}}
 progress_field() {{ sed -n "s/^$1: *//p" "$PROGRESS" | head -1 | tr -d '[:space:]'; }}
 source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
 {function} "$@"
 """
-        environ = {**os.environ, **IDENTITY, "FAKE_MERGED": str(self.merged), **env}
+        environ = {**os.environ, **IDENTITY, "FAKE_MERGED": str(self.merged), "FAKE_RERUN": str(self.rerun), **env}
         environ["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         return subprocess.run(
             ["timeout", str(timeout), "bash", "-c", script, "bash", *args],
@@ -479,6 +522,9 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         result = self.run_loop(FAKE_COMMIT, DEPENDABOT_MERGE="auto")
         self.assertEqual(result.returncode, 3)
         self.assertIn("DEPENDABOT_MERGE must be squash, merge, rebase, report or ignore, got 'auto'", result.stderr)
+        result = self.run_loop(FAKE_COMMIT, DEPENDABOT_TRIAGE="sonnet")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("DEPENDABOT_TRIAGE must be judge or off, got 'sonnet'", result.stderr)
         self.assertEqual(self.calls(), 0)
 
     def test_task_model_line_picks_the_model(self):
@@ -1003,9 +1049,7 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         landed = self.land_on_main("lock.txt", "2\n")
         result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.merges(), [f"pr merge 12 --squash --delete-branch --match-head-commit {DEPENDABOT_SHA}"]
-        )
+        self.assertEqual(self.merges(), [f"pr merge 12 --squash --delete-branch --match-head-commit {DEPENDABOT_SHA}"])
         self.assertIn(
             "NOTIFY: autoloop: merged Dependabot pull request #12 (Bump x from 1 to 2) into main: its checks were "
             "green. https://example.invalid/pr/12",
@@ -1024,26 +1068,190 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertNotIn("LOG: merged main", again.stdout)
 
-    def test_red_dependabot_pull_request_is_told_once_and_left(self):
-        head = git(self.repo, "rev-parse", "HEAD")
-        checks = "fail gate https://example.invalid/actions/runs/43/job/8"
-        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_PR_CHECKS=checks)
+    def reruns(self) -> list[str]:
+        """The gh run rerun calls the scripted gh recorded."""
+        return self.rerun.read_text().splitlines() if self.rerun.exists() else []
+
+    def red(self, **env: str) -> subprocess.CompletedProcess:
+        """One look at the Dependabot pull request #12 with a failed check."""
+        result = self.call("check_dependabot_prs", **{"FAKE_PRS": DEPENDABOT_PR, "FAKE_PR_CHECKS": RED_CHECK, **env})
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.merges(), [])
+        return result
+
+    def seen(self) -> str:
+        return (self.tmp / "log" / "dependabot-seen").read_text()
+
+    def test_red_dependabot_pull_request_without_triage_is_told_once_and_left(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        result = self.red(DEPENDABOT_TRIAGE="off")
         self.assertIn(
             "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is RED: check gate failed on aaaaaaa; "
             "it is left to you. https://example.invalid/pr/12",
             result.stdout,
         )
-        self.assertEqual(self.merges(), [])
+        self.assertNotIn("INVOKE", result.stderr)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
-        again = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR, FAKE_PR_CHECKS=checks)
-        self.assertEqual(again.returncode, 0, again.stderr)
+        again = self.red(DEPENDABOT_TRIAGE="off")
         self.assertNotIn("NOTIFY", again.stdout)
-        self.assertEqual((self.tmp / "log" / "dependabot-seen").read_text(), f"12 {DEPENDABOT_SHA} red\n")
+        self.assertEqual(self.seen(), f"12 {DEPENDABOT_SHA} red\n")
         # A new head of the same pull request is looked at afresh.
         moved = DEPENDABOT_PR.replace(DEPENDABOT_SHA, "b" * 40)
-        third = self.call("check_dependabot_prs", FAKE_PRS=moved, FAKE_PR_CHECKS=checks)
+        third = self.red(DEPENDABOT_TRIAGE="off", FAKE_PRS=moved)
         self.assertIn("is RED: check gate failed on bbbbbbb", third.stdout)
+
+    def test_red_dependabot_pull_request_judged_flaky_runs_again_once(self):
+        result = self.red(FAKE_RESULT=FLAKY)
+        self.assertIn("LOG: judge run on the red Dependabot #12 at aaaaaaa (gate)", result.stdout)
+        self.assertIn("INVOKE: dependabot opus 40", result.stderr)
+        self.assertEqual(self.reruns(), ["run rerun 43 --failed"])
+        self.assertIn(
+            "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is red on aaaaaaa (check gate) and the "
+            "judge calls it flaky: npm answered 503 in step Install; Its failed jobs run again once: green is merged, "
+            "red again is told to you. https://example.invalid/pr/12",
+            result.stdout,
+        )
+        self.assertEqual(self.seen(), f"12 {DEPENDABOT_SHA} rerun\n")
+        # The judge was given the pull request's facts and the files the wrapper saved for it.
+        log_dir = self.tmp / "log"
+        prompt = (log_dir / "prompt").read_text()
+        self.assertTrue(prompt.startswith((CORE / "prompts" / "dependabot.md").read_text()))
+        self.assertIn(
+            f'The pull request: #12, "Bump x from 1 to 2", https://example.invalid/pr/12, head commit {DEPENDABOT_SHA}',
+            prompt,
+        )
+        self.assertIn(f"{RED_CHECK}\nThe log of the failed jobs: {log_dir}/dependabot-12-aaaaaaa.log\n", prompt)
+        self.assertEqual(
+            (log_dir / "dependabot-12-aaaaaaa.log").read_text(),
+            "# run 43\ngate\tInstall\tnpm ERR! 503 Service Unavailable\n",
+        )
+        self.assertEqual((log_dir / "dependabot-12-aaaaaaa.diff").read_text(), "-x==1\n+x==2\n")
+        # The verdict is in the judge log, in the form the status report reads.
+        self.assertRegex(
+            (log_dir / "judge.log").read_text(),
+            r"^\d{4}-\d\d-\d\dT[\d:]{8}Z Dependabot #12 at aaaaaaa judged flaky: npm answered 503 in step Install;\n$",
+        )
+        # Still being checked after the re-run: nothing. Green: merged like any other.
+        pending = self.red(FAKE_PR_CHECKS="pending gate https://example.invalid/actions/runs/43/job/8")
+        self.assertEqual(pending.stdout, "")
+        # Red again on the same head: the owner is told, with no second judge run and no second re-run.
+        again = self.red(FAKE_RESULT=FLAKY)
+        self.assertIn(
+            "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is RED again after its failed jobs ran "
+            "a second time: check gate failed on aaaaaaa. The judge had called the first failure flaky; it is left to "
+            "you. https://example.invalid/pr/12",
+            again.stdout,
+        )
+        self.assertNotIn("INVOKE", again.stderr)
+        self.assertEqual(self.reruns(), ["run rerun 43 --failed"])
+        third = self.red(FAKE_RESULT=FLAKY)
+        self.assertEqual(third.stdout, "")
+        self.assertEqual(self.seen(), f"12 {DEPENDABOT_SHA} rerun\n12 {DEPENDABOT_SHA} red\n")
+
+    def test_green_after_the_rerun_is_merged(self):
+        self.add_remote()
+        self.red(FAKE_RESULT=FLAKY)
+        result = self.call("check_dependabot_prs", FAKE_PRS=DEPENDABOT_PR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_flaky_verdict_whose_rerun_fails_is_left_to_the_owner(self):
+        result = self.red(FAKE_RESULT=FLAKY, FAKE_RERUN_RC="1")
+        self.assertIn(
+            "is RED: check gate failed on aaaaaaa. The judge calls it flaky: npm answered 503 in step Install; The "
+            "failed jobs could not be started again (see kickoff.log); it is left to you.",
+            result.stdout,
+        )
+        self.assertEqual(self.seen(), f"12 {DEPENDABOT_SHA} red\n")
+
+    def test_red_dependabot_pull_request_judged_broken_is_told_with_the_reason(self):
+        result = self.red(FAKE_RESULT=BREAK)
+        self.assertIn(
+            "NOTIFY: autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is RED: check gate failed on aaaaaaa. "
+            "The judge: the update breaks the build: tests/test_x.py fails on the removed x.old() call. It is left to "
+            "you. https://example.invalid/pr/12",
+            result.stdout,
+        )
+        self.assertEqual(self.reruns(), [])
+        self.assertEqual(self.seen(), f"12 {DEPENDABOT_SHA} red\n")
+        again = self.red(FAKE_RESULT=BREAK)
+        self.assertEqual(again.stdout, "")
+        self.assertNotIn("INVOKE", again.stderr)
+
+    def test_red_dependabot_pull_request_the_judge_is_unsure_about_is_told(self):
+        result = self.red(FAKE_RESULT=UNSURE)
+        self.assertIn(
+            "is RED: check gate failed on aaaaaaa. The judge could not tell a flaky check from a broken update: the "
+            "log is empty. It is left to you.",
+            result.stdout,
+        )
+        self.assertEqual(self.reruns(), [])
+
+    def test_triage_without_a_verdict_tells_the_owner(self):
+        for env in (
+            {"FAKE_RESULT": verdict("It looks flaky to me.")},
+            {"FAKE_RESULT": verdict("VERDICT: merge it\nREASON: none")},
+            {"FAKE_RESULT": "not json"},
+            {"FAKE_INVOKE_RC": "1"},
+        ):
+            with self.subTest(env=env):
+                (self.tmp / "log" / "dependabot-seen").unlink(missing_ok=True)
+                result = self.red(**env)
+                self.assertIn(
+                    "is RED: check gate failed on aaaaaaa; the judge run gave no verdict; it is left to you.",
+                    result.stdout,
+                )
+                self.assertEqual(self.reruns(), [])
+                self.assertFalse((self.tmp / "log" / "judge.log").exists())
+
+    def test_verdict_reason_is_one_line_and_cut(self):
+        result = self.red(FAKE_RESULT=verdict("VERDICT: break\nREASON: " + "long  words " * 60))
+        line = next(x for x in result.stdout.splitlines() if x.startswith("NOTIFY"))
+        reason = line.split("breaks the build: ")[1].split(" It is left")[0]
+        self.assertEqual(len(reason), 300)
+        self.assertTrue(reason.startswith("long words long words"))
+        self.assertTrue(reason.endswith("…"))
+
+    def test_triage_at_the_usage_limit_waits_for_the_next_look(self):
+        result = self.red(FAKE_INVOKE_RC="75")
+        self.assertNotIn("NOTIFY", result.stdout)
+        self.assertIn("LOG: usage limit: the triage of Dependabot #12 waits for the next look", result.stdout)
+        self.assertFalse((self.tmp / "log" / "dependabot-seen").exists())
+        again = self.red(FAKE_RESULT=BREAK)
+        self.assertIn("The judge: the update breaks the build", again.stdout)
+
+    def test_checks_refused_for_billing_are_not_given_to_the_judge(self):
+        checks = "fail gate https://example.invalid/actions/runs/42/job/7"
+        result = self.red(FAKE_PR_CHECKS=checks, FAKE_BILLING="1", FAKE_RESULT=FLAKY)
+        self.assertIn(
+            "NOTIFY: autoloop: GitHub did not start check gate on Dependabot pull request #12 (Bump x from 1 to 2) "
+            "(billing or spending limit), so nothing is known about aaaaaaa; it is left to you.",
+            result.stdout,
+        )
+        self.assertNotIn("INVOKE", result.stderr)
+        self.assertEqual(self.reruns(), [])
+        again = self.red(FAKE_PR_CHECKS=checks, FAKE_BILLING="1", FAKE_RESULT=FLAKY)
+        self.assertEqual(again.stdout, "")
+
+    def test_loop_has_the_judge_triage_a_red_dependabot_pull_request(self):
+        result = self.run_loop(FAKE_TRIAGE_FLAKY, "--once", FAKE_PRS=DEPENDABOT_PR, FAKE_PR_CHECKS=RED_CHECK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("judge run on the red Dependabot #12 at aaaaaaa (gate)", result.stdout)
+        self.assertIn(
+            "telegram (not configured): autoloop: Dependabot pull request #12 (Bump x from 1 to 2) is red on aaaaaaa "
+            "(check gate) and the judge calls it flaky: the registry answered 503.",
+            result.stdout,
+        )
+        self.assertEqual(self.reruns(), ["run rerun 43 --failed"])
+        self.assertEqual(self.merges(), [])
+        # The triage run and the task run that follows it; the triage is no stage of the loop.
+        self.assertEqual(self.calls(), 2)
+        self.assertEqual(git(self.repo, "log", "-1", "--format=%s"), "fake work\n")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        status = self.telegram("status-text")
+        self.assertRegex(
+            status.stdout, r"judge:\n\d\d:\d\d Dependabot #12 at aaaaaaa judged flaky: the registry answered 503\."
+        )
 
     def test_dependabot_pull_request_not_ready_waits_for_the_next_look(self):
         pending = "pending gate https://example.invalid/actions/runs/43/job/8"

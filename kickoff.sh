@@ -6,7 +6,8 @@
 # questions from the project's documents; what it cannot answer goes to the
 # owner over Telegram. Dependabot's pull requests on the base branch are looked
 # at between runs: a green one is merged and brought into the milestone branch,
-# a red one is told to the owner.
+# a red one is triaged by the judge (flaky: its failed jobs run again once;
+# broken or unclear: told to the owner with the judge's reason).
 #
 # This file is the shared core (https://github.com/AreGone/autoloop), checked
 # out as a submodule under the project's autoloop directory, by default
@@ -68,6 +69,8 @@ readonly CI_FIX_ACCEPTANCE="${CI_FIX_ACCEPTANCE:-tools/lint/lint.sh}"
 readonly LOCAL_GATE="${LOCAL_GATE:-${CI_FIX_ACCEPTANCE}}"
 readonly LOCAL_GATE_TIMEOUT_S="${LOCAL_GATE_TIMEOUT_S:-7200}"
 readonly DEPENDABOT_MERGE="${DEPENDABOT_MERGE:-squash}"
+# Who looks at a red Dependabot pull request first: judge (a judge run triages it) or off (the owner is told).
+readonly DEPENDABOT_TRIAGE="${DEPENDABOT_TRIAGE:-judge}"
 readonly PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-60000}"
 readonly GIT_REMOTE="${GIT_REMOTE:-origin}"
 readonly BASE_BRANCH="${BASE_BRANCH:-main}"
@@ -114,7 +117,7 @@ notify() {
 #######################################
 # The prompt file of a run: the project's prompts/<name>.md when it exists, else the core's.
 # Arguments:
-#   The run name (plan, task, verify, judge).
+#   The run name (plan, task, verify, judge, dependabot).
 #######################################
 prompt_file() {
   if [[ -f "${AUTOLOOP_DIR}/prompts/$1.md" ]]; then
@@ -720,7 +723,7 @@ merge_base_branch() {
 # Tell the owner about a Dependabot pull request once per head commit and state; the pairs told
 # are kept in log/dependabot-seen.
 # Arguments:
-#   The pull request number, its head sha, the state (red, green, unmerged), the message.
+#   The pull request number, its head sha, the state (red, billing, rerun, green, unmerged), the message.
 #######################################
 dependabot_tell() {
   local seen="${LOG_DIR}/dependabot-seen" key="$1 $2 $3"
@@ -732,17 +735,144 @@ dependabot_tell() {
 }
 
 #######################################
+# The judge's triage of a red Dependabot pull request. The wrapper saves the failed jobs' log and
+# the pull request's diff under log/ (dependabot-<number>-<sha>.log and .diff); the judge run
+# (JUDGE_MODEL, prompts/dependabot.md with the pull request's facts appended) reads them, changes
+# nothing and ends with a "VERDICT:" and a "REASON:" line, which are read from its result file.
+# Arguments:
+#   The pull request number, its head sha, its title, its url, the failing check lines.
+# Outputs:
+#   "<verdict> <reason>" on stdout: the verdict is flaky, break or unsure, the reason one line.
+# Returns:
+#   0 a verdict, 1 none (the run failed or named no verdict), 2 usage limit (ask again later).
+#######################################
+dependabot_triage() {
+  local number="$1" sha="$2" title="$3" url="$4" failing="$5"
+  local base="${LOG_DIR}/dependabot-${number}-${sha:0:7}" prompt ids id rc=0 result
+  prompt="$(prompt_file dependabot)" || return 1
+  : > "${base}.log"
+  ids="$(grep -oE 'runs/[0-9]+' <<< "${failing}" | cut -d/ -f2 | sort -u)"
+  for id in ${ids}; do
+    { echo "# run ${id}"; gh run view "${id}" --log-failed 2>&1 || true; } >> "${base}.log"
+  done
+  gh pr diff "${number}" > "${base}.diff" 2>> "${RUN_LOG}" || true
+  {
+    cat "${prompt}"
+    printf '\nThe pull request: #%s, "%s", %s, head commit %s, against %s.\nIts failed checks, one per line as "<state> <name> <link>":\n%s\nThe log of the failed jobs: %s\nThe diff: %s\n' \
+      "${number}" "${title}" "${url}" "${sha}" "${BASE_BRANCH}" "${failing}" "${base}.log" "${base}.diff"
+  } > "${base}.prompt.md"
+  # In a subshell: a claude that is not logged in ends this triage, not the wait this may be called from.
+  ( invoke dependabot "${JUDGE_MODEL}" "${base}.prompt.md" "${JUDGE_MAX_TURNS}" ) >&2 || rc=$?
+  if (( rc == 75 )); then
+    return 2
+  fi
+  (( rc == 0 )) || return 1
+  # The newest result file; the names are timestamps.
+  # shellcheck disable=SC2012
+  result="$(ls -t "${LOG_DIR}"/*-dependabot.json 2>/dev/null | head -1)"
+  python3 -I - "${result}" <<'PY'
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        data = next((d for d in reversed(data) if d.get("type") == "result"), data[-1])
+    text = str(data.get("result") or "")
+except (OSError, ValueError, AttributeError, IndexError):
+    text = ""
+verdicts = re.findall(r"(?mi)^\W*VERDICT:\W*(flaky|break|unsure)\b", text)
+if not verdicts:
+    sys.exit(1)
+reasons = re.findall(r"(?mi)^\W*REASON:\W*(.+)$", text)
+reason = " ".join(reasons[-1].split()) if reasons else ""
+if len(reason) > 300:
+    reason = reason[:299].rstrip() + "…"
+print(verdicts[-1].lower(), reason or "(no reason given)")
+PY
+}
+
+#######################################
+# A red Dependabot pull request, looked at once per head commit. Checks GitHub refused to start
+# for billing say nothing about the update and are told as such. Otherwise the judge triages it
+# (DEPENDABOT_TRIAGE=judge): "flaky" runs the failed jobs again, once per head commit, and the next
+# looks merge it when green or tell the owner when red again; "break" and "unsure" are told to the
+# owner with the judge's reason. Without a verdict (DEPENDABOT_TRIAGE=off, a failed run) the owner
+# is told the check failed. Never merged while red. Verdicts are appended to log/judge.log for the
+# hourly status report.
+# Arguments:
+#   The pull request number, its head sha, its title, its url, the failing check lines.
+#######################################
+dependabot_red() {
+  local number="$1" sha="$2" title="$3" url="$4" failing="$5"
+  local seen="${LOG_DIR}/dependabot-seen" what names line="" verdict="" reason="" ids id rc=0 reran=1
+  what="Dependabot pull request #${number} (${title})"
+  names="$(awk '{print $2}' <<< "${failing}" | paste -sd, -)"
+  if grep -qxF -e "${number} ${sha} red" -e "${number} ${sha} billing" "${seen}" 2>/dev/null; then
+    return 0
+  fi
+  if grep -qxF "${number} ${sha} rerun" "${seen}" 2>/dev/null; then
+    dependabot_tell "${number}" "${sha}" red \
+      "${what} is RED again after its failed jobs ran a second time: check ${names} failed on ${sha:0:7}. The judge had called the first failure flaky; it is left to you. ${url}"
+    return 0
+  fi
+  if billing_refused "${failing}"; then
+    dependabot_tell "${number}" "${sha}" billing \
+      "GitHub did not start check ${names} on ${what} (billing or spending limit), so nothing is known about ${sha:0:7}; it is left to you. ${url}"
+    return 0
+  fi
+  if [[ "${DEPENDABOT_TRIAGE}" == "judge" ]]; then
+    log "judge run on the red Dependabot #${number} at ${sha:0:7} (${names})"
+    line="$(dependabot_triage "${number}" "${sha}" "${title}" "${url}" "${failing}")" || rc=$?
+    if (( rc == 2 )); then
+      log "usage limit: the triage of Dependabot #${number} waits for the next look"
+      return 0
+    fi
+    if (( rc == 0 )); then
+      verdict="${line%% *}"
+      reason="${line#* }"
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Dependabot #${number} at ${sha:0:7} judged ${verdict}: ${reason}" >> "${JUDGE_LOG}"
+    fi
+  fi
+  case "${verdict}" in
+    flaky)
+      ids="$(grep -oE 'runs/[0-9]+' <<< "${failing}" | cut -d/ -f2 | sort -u)"
+      for id in ${ids}; do
+        gh run rerun "${id}" --failed >> "${RUN_LOG}" 2>&1 || reran=0
+      done
+      if (( reran )); then
+        dependabot_tell "${number}" "${sha}" rerun \
+          "${what} is red on ${sha:0:7} (check ${names}) and the judge calls it flaky: ${reason} Its failed jobs run again once: green is merged, red again is told to you. ${url}"
+      else
+        dependabot_tell "${number}" "${sha}" red \
+          "${what} is RED: check ${names} failed on ${sha:0:7}. The judge calls it flaky: ${reason} The failed jobs could not be started again (see kickoff.log); it is left to you. ${url}"
+      fi ;;
+    break)
+      dependabot_tell "${number}" "${sha}" red \
+        "${what} is RED: check ${names} failed on ${sha:0:7}. The judge: the update breaks the build: ${reason} It is left to you. ${url}" ;;
+    unsure)
+      dependabot_tell "${number}" "${sha}" red \
+        "${what} is RED: check ${names} failed on ${sha:0:7}. The judge could not tell a flaky check from a broken update: ${reason} It is left to you. ${url}" ;;
+    *)
+      if [[ "${DEPENDABOT_TRIAGE}" == "judge" ]]; then
+        reason=" the judge run gave no verdict;"
+      fi
+      dependabot_tell "${number}" "${sha}" red \
+        "${what} is RED: check ${names} failed on ${sha:0:7};${reason} it is left to you. ${url}" ;;
+  esac
+}
+
+#######################################
 # Look at the open Dependabot pull requests against the base branch. A green, mergeable one is
 # merged with the DEPENDABOT_MERGE method (only while its head is still the commit whose checks
-# were read) and the base branch is then merged into the milestone branch; a red one is told to
-# the owner once per head commit and left alone; one still being checked, one that conflicts
+# were read) and the base branch is then merged into the milestone branch; a red one is triaged
+# once per head commit (dependabot_red) and never merged; one still being checked, one that conflicts
 # (Dependabot rebases it itself) and one with a review asking for changes wait for the next look.
 # DEPENDABOT_MERGE=report tells the owner about a green one instead of merging it; ignore looks
 # at nothing. Never fails the loop; gh missing or failing means nothing to look at.
 #######################################
 check_dependabot_prs() {
   local -a prs
-  local line number sha mergeable review draft url title checks names
+  local line number sha mergeable review draft url title checks failing
   [[ "${DEPENDABOT_MERGE}" != "ignore" ]] || return 0
   command -v gh >/dev/null 2>&1 || return 0
   mapfile -t prs < <(gh pr list --app dependabot --state open --base "${BASE_BRANCH}" --limit 50 \
@@ -754,10 +884,9 @@ check_dependabot_prs() {
     IFS='|' read -r number sha mergeable review draft url title <<< "${line}"
     [[ "${number}" =~ ^[0-9]+$ && "${draft}" != "true" ]] || continue
     checks="$(gh pr checks "${number}" --json name,bucket,link --jq '.[] | "\(.bucket) \(.name) \(.link)"' 2>/dev/null || true)"
-    names="$(grep -E '^(fail|cancel) ' <<< "${checks}" | awk '{print $2}' | paste -sd, - || true)"
-    if [[ -n "${names}" ]]; then
-      dependabot_tell "${number}" "${sha}" red \
-        "Dependabot pull request #${number} (${title}) is RED: check ${names} failed on ${sha:0:7}; it is left to you. ${url}"
+    failing="$(grep -E '^(fail|cancel) ' <<< "${checks}" || true)"
+    if [[ -n "${failing}" ]]; then
+      dependabot_red "${number}" "${sha}" "${title}" "${url}" "${failing}"
       continue
     fi
     if [[ -z "${checks}" ]] || grep -qE '^pending ' <<< "${checks}"; then
@@ -992,7 +1121,7 @@ ensure_branch() {
 
 #######################################
 # The runs that judge (plan, verify, judge) need the strong model: a cheaper alias here is a setup
-# error, as is a DEPENDABOT_MERGE the loop does not know.
+# error, as is a DEPENDABOT_MERGE or a DEPENDABOT_TRIAGE the loop does not know.
 #######################################
 check_settings() {
   local m
@@ -1005,6 +1134,10 @@ check_settings() {
   case "${DEPENDABOT_MERGE}" in
     squash|merge|rebase|report|ignore) ;;
     *) echo "DEPENDABOT_MERGE must be squash, merge, rebase, report or ignore, got '${DEPENDABOT_MERGE}'" >&2; exit 3 ;;
+  esac
+  case "${DEPENDABOT_TRIAGE}" in
+    judge|off) ;;
+    *) echo "DEPENDABOT_TRIAGE must be judge or off, got '${DEPENDABOT_TRIAGE}'" >&2; exit 3 ;;
   esac
 }
 
