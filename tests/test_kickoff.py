@@ -1427,6 +1427,7 @@ exit "$rc"
         env = self.staging_env(61100, FAKE_SEEN=str(self.tmp / "seen"))
         result = self.run_loop(fake, MAX_ITERATIONS="3", STAGING_UP=STAGING_SERVE, STAGING_SERVICES="web api", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")  # a missing pid file or a kill is never noise in the journal
         ports = self.ports()
         self.assertEqual(sorted(ports), ["api", "web"])
         self.assertGreaterEqual(min(ports.values()), 61100)
@@ -1514,6 +1515,7 @@ exit "$rc"
             **env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
         port = self.ports()["web"]
         start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
         self.assertIn(

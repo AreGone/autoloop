@@ -129,7 +129,8 @@ process_start() {
 #######################################
 staging_kill_up() {
   local pid started
-  read -r pid started < "${STAGING_PID}" 2>/dev/null || return 0
+  [[ -f "${STAGING_PID}" ]] || return 0
+  read -r pid started < "${STAGING_PID}" || return 0
   rm -f "${STAGING_PID}"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null || return 0
   [[ "$(process_start "${pid}")" == "${started:-}" ]] || return 0
