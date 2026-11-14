@@ -132,10 +132,9 @@ FAKE_GH = """#!/usr/bin/env bash
 # commit (run 43, no annotations); with FAKE_THEN_COMMIT too, a commit lands on the branch right after
 # that green is read, as a push from outside the loop would. With FAKE_BILLING the failed job carries
 # GitHub's billing refusal instead of the warning. Dependabot's open pull requests are the lines of
-# FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the status
-# report); #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded
-# in FAKE_MERGED, exits FAKE_MERGE_RC. Run 43 (the checks of #12) has a one-line failed log; a re-run
-# of its failed jobs is recorded in FAKE_RERUN and exits FAKE_RERUN_RC.
+# FAKE_PRS (number|sha|mergeable|review|draft|url|title; FAKE_PRS_COUNT of them for the status report);
+# #12 has the checks FAKE_PR_CHECKS (default: one passed) and its merge, recorded in FAKE_MERGED,
+# exits FAKE_MERGE_RC.
 case "$*" in
   *"pr list --app dependabot"*"--jq length"*) echo "${FAKE_PRS_COUNT:-0}" ;;
   *"pr list --app dependabot"*) printf '%s' "${FAKE_PRS:-}" ;;

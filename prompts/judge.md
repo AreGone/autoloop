@@ -44,6 +44,11 @@ To answer a question:
    "| <the question's heading without the leading '## '> | <the answer in one line> (judge) |"
    at the end of section 2, directly before the "## 3. Process" heading,
    where an owner's answer is recorded too.
+3. When the answer adds a task to the current milestone, also insert its
+   entry under "Tasks" in PROGRESS.md, in the task format of MILESTONES.md
+   (files, reads, design, acceptance, empty notes and verified), with the
+   next free task id and placed where the answer says it must run (else
+   after the last task that is not done), so the decision cannot be lost.
 To pass a question to the owner: insert, directly above its "Answer:" line,
 one line (or fill an empty "Judge:" line already there) "Judge: cannot answer: <why, in one sentence, and what the owner
 has to decide or provide> (<YYYY-MM-DD>)", and leave "Answer:" empty.
@@ -56,7 +61,8 @@ commit QUESTIONS.md, DECISIONS.md and PROGRESS.md by name, with the subject
 "Judge: answered Q<n> ..., passed Q<m> ..." (leave out the part that is
 empty). End your turn when the commit is made.
 
-Rules: change nothing else: no code, no task entries, no other document.
+Rules: change nothing else: no code, no task entry other than one your
+answer adds, no other document.
 Never weaken, remove or reinterpret a hard rule or a guardrail to make a
 question answerable. Never accept the question's "Proposed:" option without
 checking it against the documents; when it agrees with them, say which
