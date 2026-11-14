@@ -78,12 +78,13 @@ send_file() {
 
 #######################################
 # Build the progress summary from PROGRESS.md, git log and the judge log: everything since the
-# last report (at most the last hour when there was none), and the open Dependabot pull requests
-# when gh can list them.
+# last report (at most the last hour when there was none), the open Dependabot pull requests
+# when gh can list them, and the staging's services (kickoff.sh writes log/staging.ports) with
+# whether each accepts a connection on loopback.
 #######################################
 status_text() {
   cd "${REPO_ROOT}"
-  local status milestone open prog done_ verifying reopened branch commits since judge dependabot=""
+  local status milestone open prog done_ verifying reopened branch commits since judge dependabot="" staging=""
   status="$(sed -n 's/^STATUS: *//p' PROGRESS.md | head -1)"
   milestone="$(sed -n 's/^MILESTONE: *//p' PROGRESS.md | head -1)"
   open="$(grep -cE '^- \[ \] T' PROGRESS.md || true)"
@@ -101,9 +102,32 @@ status_text() {
   if command -v gh >/dev/null 2>&1; then
     dependabot="$(gh pr list --app dependabot --state open --base "${BASE_BRANCH:-main}" --json number --jq length 2>/dev/null || true)"
   fi
-  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)%s\ncommits since the last report:\n%s\njudge:\n%s\n' \
+  if [[ -s "${LOG_DIR}/staging.ports" ]]; then
+    staging="$(python3 -I - "${LOG_DIR}/staging.ports" "${STAGING_HOST:-$(hostname)}" <<'PY'
+import socket
+import sys
+
+path, host = sys.argv[1], sys.argv[2]
+services = []
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        name, port = line.split()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", int(port)))
+                state = "up"
+            except OSError:
+                state = "down"
+        services.append(f"{name} http://{host}:{port} ({state})")
+print(", ".join(services))
+PY
+)"
+    [[ -z "${staging}" ]] || staging="staging: ${staging}"$'\n'
+  fi
+  printf 'autoloop %s | %s | %s\nopen %s, in progress %s, reopened %s, done %s (verifying %s)%s\ncommits since the last report:\n%s\njudge:\n%s\n%s' \
     "${milestone}" "${status}" "${branch}" "${open}" "${prog}" "${reopened}" "${done_}" "${verifying}" \
-    "${dependabot:+; Dependabot PRs open: ${dependabot}}" "${commits:-- none}" "${judge:-- nothing answered or passed}"
+    "${dependabot:+; Dependabot PRs open: ${dependabot}}" "${commits:-- none}" "${judge:-- nothing answered or passed}" "${staging}"
 }
 
 #######################################

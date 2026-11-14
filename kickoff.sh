@@ -7,7 +7,10 @@
 # owner over Telegram. Dependabot's pull requests on the base branch are looked
 # at between runs: a green one is merged and brought into the milestone branch,
 # a red one is triaged by the judge (flaky: its failed jobs run again once;
-# broken or unclear: told to the owner with the judge's reason).
+# broken or unclear: told to the owner with the judge's reason). With
+# STAGING_UP set, the project's services run next to the loop on free ports
+# (a staging), started with the loop and brought up to date after every
+# commit, so that the owner can open what it builds.
 #
 # This file is the shared core (https://github.com/AreGone/autoloop), checked
 # out as a submodule under the project's autoloop directory, by default
@@ -71,6 +74,15 @@ readonly LOCAL_GATE_TIMEOUT_S="${LOCAL_GATE_TIMEOUT_S:-7200}"
 readonly DEPENDABOT_MERGE="${DEPENDABOT_MERGE:-squash}"
 # Who looks at a red Dependabot pull request first: judge (a judge run triages it) or off (the owner is told).
 readonly DEPENDABOT_TRIAGE="${DEPENDABOT_TRIAGE:-judge}"
+# The project's services while the loop runs (a staging the owner can open): STAGING_UP starts them
+# or brings them up to date with STAGING_PORT_<NAME> set to a free port for every name in
+# STAGING_SERVICES; empty means no staging. STAGING_DOWN stops them when the loop exits.
+readonly STAGING_UP="${STAGING_UP:-}"
+readonly STAGING_DOWN="${STAGING_DOWN:-}"
+readonly STAGING_SERVICES="${STAGING_SERVICES:-}"
+readonly STAGING_PORT_BASE="${STAGING_PORT_BASE:-42000}"
+readonly STAGING_HOST="${STAGING_HOST:-$(hostname 2>/dev/null || echo localhost)}"
+readonly STAGING_READY_S="${STAGING_READY_S:-120}"
 readonly PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-60000}"
 readonly GIT_REMOTE="${GIT_REMOTE:-origin}"
 readonly BASE_BRANCH="${BASE_BRANCH:-main}"
@@ -92,6 +104,11 @@ done
 mkdir -p "${LOG_DIR}"
 readonly RUN_LOG="${LOG_DIR}/kickoff.log"
 readonly JUDGE_LOG="${LOG_DIR}/judge.log"
+# The staging's ports ("<name> <port>" lines), the output of STAGING_UP and STAGING_DOWN, and the
+# pid (with its start time) of a STAGING_UP that keeps running.
+readonly STAGING_PORTS="${LOG_DIR}/staging.ports"
+readonly STAGING_LOG="${LOG_DIR}/staging.log"
+readonly STAGING_PID="${LOG_DIR}/staging.pid"
 
 #######################################
 # Log a line with a UTC timestamp to stdout and the run log.
@@ -927,6 +944,249 @@ run_local_gate() {
 }
 
 #######################################
+# The staging: the project's services, up next to the loop so that the owner can open what it
+# builds. STAGING_UP (autoloop.env) starts them or brings them up to date; it runs when the loop
+# starts and again after every commit, with STAGING_PORT_<NAME> set for every name in
+# STAGING_SERVICES.
+#######################################
+
+#######################################
+# The environment variable that carries a service's port: STAGING_PORT_<NAME>, the name in upper
+# case with every character that is not a letter or a digit as "_" (my-api: STAGING_PORT_MY_API).
+# Arguments:
+#   The service name.
+#######################################
+staging_var() {
+  local name="${1^^}"
+  echo "STAGING_PORT_${name//[^A-Z0-9]/_}"
+}
+
+#######################################
+# Give every service a free port and export it as STAGING_PORT_<NAME>: the port recorded in
+# log/staging.ports when it is still free, else the first free one at or above STAGING_PORT_BASE
+# that no other service got. The file is written again, so the ports stay the same across runs
+# and restarts of the loop while nothing else takes them. No free port is a setup error.
+#######################################
+staging_allocate() {
+  local name port
+  # shellcheck disable=SC2086
+  python3 -I - "${STAGING_PORTS}" "${STAGING_PORT_BASE}" ${STAGING_SERVICES} > "${STAGING_PORTS}.tmp" <<'PY' \
+    || { log "staging: no free port for every service at or above ${STAGING_PORT_BASE}"; exit 3; }
+import socket
+import sys
+
+path, base, names = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+recorded = {}
+try:
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                recorded[parts[0]] = int(parts[1])
+except OSError:
+    pass
+
+
+def free(port: int) -> bool:
+    # Taken when something listens on it; a connection of an earlier service still closing does not count.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", port))
+        except OSError:
+            return False
+    return True
+
+
+taken = set()
+candidate = base
+for name in names:
+    port = recorded.get(name)
+    if port is None or port in taken or not free(port):
+        while candidate in taken or not free(candidate):
+            candidate += 1
+            if candidate > 65535:
+                sys.exit(f"no free port at or above {base}")
+        port = candidate
+    taken.add(port)
+    print(name, port)
+PY
+  mv "${STAGING_PORTS}.tmp" "${STAGING_PORTS}"
+  while read -r name port; do
+    export "$(staging_var "${name}")=${port}"
+  done < "${STAGING_PORTS}"
+}
+
+#######################################
+# The services that do not accept a TCP connection on loopback within a second, one name per line.
+#######################################
+staging_unready() {
+  python3 -I - "${STAGING_PORTS}" <<'PY'
+import socket
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        name, port = line.split()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", int(port)))
+            except OSError:
+                print(name)
+PY
+}
+
+#######################################
+# The services as told to the owner: "<name> http://<STAGING_HOST>:<port>" each, joined by ", ",
+# with "(not answering)" after the ones named in the argument.
+# Arguments:
+#   The names that do not answer, one per line (may be empty).
+#######################################
+staging_urls() {
+  local name port mark out=""
+  while read -r name port; do
+    mark=""
+    grep -qx "${name}" <<< "$1" && mark=" (not answering)"
+    out+="${out:+, }${name} http://${STAGING_HOST}:${port}${mark}"
+  done < "${STAGING_PORTS}"
+  echo "${out:-no service declared}"
+}
+
+#######################################
+# When a process started, as /proc or ps report it; empty for one that is gone. With the pid it
+# tells the process the wrapper started from another one that got the same pid after it ended.
+# Arguments:
+#   The pid.
+#######################################
+process_start() {
+  { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; } || ps -o lstart= -p "$1" 2>/dev/null || true
+}
+
+#######################################
+# Stop the STAGING_UP of the last call when it still runs (it is the service, a dev server): TERM
+# to its process group, KILL after ten seconds. The pid file names the process and when it
+# started; a pid that now belongs to another process is only forgotten.
+#######################################
+staging_kill_up() {
+  local pid started i
+  read -r pid started < "${STAGING_PID}" 2>/dev/null || return 0
+  rm -f "${STAGING_PID}"
+  [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null || return 0
+  [[ "$(process_start "${pid}")" == "${started:-}" ]] || return 0
+  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  for i in {1..10}; do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+}
+
+#######################################
+# Start the services, or bring them up to date with HEAD. A STAGING_UP of the last call that still
+# runs is stopped first. STAGING_UP runs in the background from the repository root, in a session
+# of its own so that it can be stopped with everything it started, with the ports in its
+# environment and its output appended to log/staging.log; the wrapper then waits until every
+# service answers on its port, STAGING_UP fails, or STAGING_READY_S seconds have passed. A
+# STAGING_UP that returns (docker compose up -d) has detached the services; one that keeps
+# running (a dev server) is left running until the next call or the exit.
+# Globals:
+#   staging_head: the commit staged. staging_state: the services with their URLs, the ones that
+#   do not answer marked, after what went wrong when STAGING_UP failed.
+# Returns:
+#   0 every service answers, 1 some do not or STAGING_UP failed.
+#######################################
+staging_up() {
+  local pid rc=0 waited=0 unready="" setsid=""
+  staging_kill_up
+  staging_head="$(git rev-parse HEAD)"
+  echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ) up at ${staging_head:0:7}: ${STAGING_UP}" >> "${STAGING_LOG}"
+  command -v setsid >/dev/null 2>&1 && setsid=setsid
+  # shellcheck disable=SC2086
+  (cd "${REPO_ROOT}" && exec ${setsid} bash -c "${STAGING_UP}") >> "${STAGING_LOG}" 2>&1 < /dev/null &
+  pid=$!
+  echo "${pid} $(process_start "${pid}")" > "${STAGING_PID}"
+  while true; do
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      wait "${pid}" || rc=$?
+      pid=""
+      rm -f "${STAGING_PID}"
+      (( rc == 0 )) || break
+    fi
+    unready="$(staging_unready)"
+    [[ -n "${unready}" ]] || break
+    (( waited < STAGING_READY_S )) || break
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  (( rc == 0 )) || unready="$(staging_unready)"
+  staging_state="$(staging_urls "${unready}")"
+  if (( rc != 0 )); then
+    staging_state="STAGING_UP exited ${rc} ($(tail -1 "${STAGING_LOG}" | cut -c1-200)); ${staging_state}"
+    return 1
+  fi
+  [[ -z "${unready}" ]]
+}
+
+#######################################
+# Bring the staging up when the loop starts, for a project with STAGING_UP: STAGING_DOWN first,
+# when set, so that services of an earlier loop are gone and their ports free; then the ports,
+# STAGING_UP, and the owner gets the URLs. The staging is stopped when the loop exits.
+#######################################
+staging_start() {
+  [[ -n "${STAGING_UP}" ]] || return 0
+  if (( dry_run )); then
+    log "dry-run: would start the staging (${STAGING_UP}) for ${STAGING_SERVICES:-no declared service}"
+    return 0
+  fi
+  trap staging_stop EXIT
+  staging_down
+  staging_allocate
+  staging_up || true
+  staging_told="${staging_state}"
+  log "staging at ${staging_head:0:7}: ${staging_state}"
+  notify "autoloop: staging for $(progress_field MILESTONE) at ${staging_head:0:7}: ${staging_state}. It follows every commit; the services' output is in ${AUTOLOOP_REL}/log/staging.log."
+}
+
+#######################################
+# After a commit: STAGING_UP again, so that the staging shows HEAD. The owner hears of it when the
+# state changed since the last message (a service stopped answering or answers again, STAGING_UP
+# failed), not on every commit; every refresh is a line in kickoff.log.
+#######################################
+staging_sync() {
+  [[ -n "${staging_head:-}" && "$(git rev-parse HEAD)" != "${staging_head}" ]] || return 0
+  staging_up || true
+  log "staging refreshed at ${staging_head:0:7}: ${staging_state}"
+  if [[ "${staging_state}" != "${staging_told}" ]]; then
+    staging_told="${staging_state}"
+    notify "autoloop: staging at ${staging_head:0:7}: ${staging_state}."
+  fi
+}
+
+#######################################
+# STAGING_DOWN, when set, from the repository root with its output in log/staging.log; a failure
+# is logged, never fatal.
+#######################################
+staging_down() {
+  [[ -n "${STAGING_DOWN}" ]] || return 0
+  local -a limit=()
+  command -v timeout >/dev/null 2>&1 && limit=(timeout 300)
+  echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ) down: ${STAGING_DOWN}" >> "${STAGING_LOG}"
+  (cd "${REPO_ROOT}" && ${limit[@]+"${limit[@]}"} bash -c "${STAGING_DOWN}") >> "${STAGING_LOG}" 2>&1 \
+    || log "staging: STAGING_DOWN failed; see ${STAGING_LOG}"
+}
+
+#######################################
+# At exit: stop a STAGING_UP that still runs, then STAGING_DOWN. Detached services of a project
+# without STAGING_DOWN stay up; the next start brings them up to date.
+#######################################
+staging_stop() {
+  staging_kill_up
+  staging_down
+  log "staging stopped with the loop"
+}
+
+#######################################
 # Block until the branch's pull request is merged, closed, or a check fails on its head commit.
 # Checks are read with gh (buckets pass, fail, pending, skipping, cancel) and only when the pull
 # request's head is the local HEAD, so a stale rollup from the previous push is never judged.
@@ -938,7 +1198,8 @@ run_local_gate() {
 # job GitHub refused to start for billing, CI is not relied on: LOCAL_GATE runs once on that head,
 # green waits for the merge, red is reported as the check "local-gate" whose link is the gate's log.
 # Dependabot's pull requests are looked at on every poll; when a merge of the base branch moved
-# the head, the branch is pushed and its checks are watched from the start again.
+# the head, the branch is pushed and its checks are watched from the start again. The staging
+# follows the head too.
 # Outputs:
 #   On a failed check: one line per failing check, "<bucket> <name> <link>".
 # Returns:
@@ -972,6 +1233,7 @@ wait_for_pr() {
       log "pull request head moved to ${pr_head}; fast-forwarded ${branch} to it" >&2
       head="${pr_head}"
     fi
+    staging_sync >&2
     if [[ "${head}" != "${judged}" ]]; then
       # A new head: its checks are judged afresh and green is told again.
       judged="${head}"
@@ -1121,7 +1383,8 @@ ensure_branch() {
 
 #######################################
 # The runs that judge (plan, verify, judge) need the strong model: a cheaper alias here is a setup
-# error, as is a DEPENDABOT_MERGE or a DEPENDABOT_TRIAGE the loop does not know.
+# error, as is a DEPENDABOT_MERGE or a DEPENDABOT_TRIAGE the loop does not know, or a staging
+# setting that cannot work.
 #######################################
 check_settings() {
   local m
@@ -1139,6 +1402,24 @@ check_settings() {
     judge|off) ;;
     *) echo "DEPENDABOT_TRIAGE must be judge or off, got '${DEPENDABOT_TRIAGE}'" >&2; exit 3 ;;
   esac
+  local name
+  # shellcheck disable=SC2086
+  for name in ${STAGING_SERVICES}; do
+    [[ "${name}" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] \
+      || { echo "a name in STAGING_SERVICES is letters, digits, _ and -, starting with a letter, got '${name}'" >&2; exit 3; }
+  done
+  if [[ -n "${STAGING_SERVICES}" && -z "${STAGING_UP}" ]]; then
+    echo "STAGING_SERVICES names ${STAGING_SERVICES} but STAGING_UP is empty: set the command that starts them, or empty STAGING_SERVICES" >&2
+    exit 3
+  fi
+  if [[ ! "${STAGING_PORT_BASE}" =~ ^[0-9]+$ ]] || (( STAGING_PORT_BASE < 1 || STAGING_PORT_BASE > 65535 )); then
+    echo "STAGING_PORT_BASE must be a port number, got '${STAGING_PORT_BASE}'" >&2
+    exit 3
+  fi
+  if [[ ! "${STAGING_READY_S}" =~ ^[0-9]+$ ]]; then
+    echo "STAGING_READY_S must be a number of seconds, got '${STAGING_READY_S}'" >&2
+    exit 3
+  fi
 }
 
 main() {
@@ -1154,11 +1435,13 @@ main() {
     exit 3
   fi
   ensure_branch
+  staging_start
 
   local iteration=0 no_progress=0 no_commit=0 no_progress_blocks=0 judge_allowed=1 progress_repairs=0 limit_backoff_s="${LIMIT_SLEEP_DEFAULT_S}"
   local stage head_before progress_before rc=0
   while (( iteration < MAX_ITERATIONS )); do
     (( dry_run )) || check_dependabot_prs
+    staging_sync
     stage="$(next_stage)"
     case "${stage}" in
       blocked)

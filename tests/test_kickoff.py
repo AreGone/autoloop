@@ -6,13 +6,16 @@ Needs git, bash, python3 and the `timeout` binary; claude is a fake script, Tele
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 CORE = Path(__file__).resolve().parents[1]
@@ -175,6 +178,23 @@ case "$*" in
 esac
 """
 RED_CHECK = "fail gate https://example.invalid/actions/runs/43/job/8"
+# The staging's STAGING_UP commands: one that keeps running (two servers in its session; stopped by the
+# wrapper), one that returns after starting a server once (stopped by STAGING_DOWN), and one that fails
+# on its second call.
+STAGING_SERVE = (
+    'echo "up $STAGING_PORT_WEB $STAGING_PORT_API" >> "$FAKE_STAGING"; '
+    'python3 -m http.server "$STAGING_PORT_WEB" --bind 127.0.0.1 & '
+    'python3 -m http.server "$STAGING_PORT_API" --bind 127.0.0.1 & wait'
+)
+STAGING_DETACH = (
+    'if ! { [ -s "$FAKE_SERVER_PID" ] && kill -0 "$(cat "$FAKE_SERVER_PID")" 2>/dev/null; }; then '
+    'python3 -m http.server "$STAGING_PORT_WEB" --bind 127.0.0.1 >/dev/null 2>&1 & echo $! > "$FAKE_SERVER_PID"; fi; '
+    'echo up >> "$FAKE_STAGING"'
+)
+STAGING_FAIL_SECOND = (
+    'echo up >> "$FAKE_STAGING"; if [ "$(wc -l < "$FAKE_STAGING")" -ge 2 ]; then echo "compose: boom"; exit 7; fi; '
+    'exec python3 -m http.server "$STAGING_PORT_WEB" --bind 127.0.0.1'
+)
 
 
 def verdict(text: str) -> str:
@@ -192,6 +212,7 @@ PR_FUNCTIONS = ";".join(
     f"/^{name}()/,/^}}/p"
     for name in (
         "wait_for_pr",
+        "staging_sync",
         "check_dependabot_prs",
         "dependabot_red",
         "dependabot_triage",
@@ -302,6 +323,50 @@ class WrapperTest(unittest.TestCase):
         """The number of times the fake claude ran."""
         count = self.tmp / "count"
         return len(count.read_text().splitlines()) if count.exists() else 0
+
+    def staging_env(self, base: int, **env: str) -> dict[str, str]:
+        """The staging settings of a test: ports from the base given (above the ephemeral range), a fixed host."""
+        return {
+            "STAGING_HOST": "stage.invalid",
+            "STAGING_PORT_BASE": str(base),
+            "STAGING_READY_S": "5",
+            "FAKE_STAGING": str(self.tmp / "staging"),
+            "FAKE_SERVER_PID": str(self.tmp / "server.pid"),
+            **env,
+        }
+
+    def staging_lines(self) -> list[str]:
+        """What the test's STAGING_UP and STAGING_DOWN recorded, in order."""
+        path = self.tmp / "staging"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def ports(self) -> dict[str, int]:
+        """The staging's ports as log/staging.ports records them."""
+        lines = (self.loop / "log" / "staging.ports").read_text().splitlines()
+        return {name: int(port) for name, port in (line.split() for line in lines)}
+
+    @staticmethod
+    def port_free(port: int) -> bool:
+        """True when nothing listens on the port (within two seconds, for a server just told to stop)."""
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("", port))
+                    return True
+                except OSError:
+                    time.sleep(0.1)
+        return False
+
+    @staticmethod
+    @contextlib.contextmanager
+    def listening(port: int):
+        """Holds the port with a listening socket."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.listen()
+            yield s
 
     def telegram(self, *args: str, **env: str) -> subprocess.CompletedProcess:
         """Runs telegram.sh with the fake gh on the PATH and Telegram not configured."""
@@ -1353,6 +1418,137 @@ source <(sed -n '{PR_FUNCTIONS}' tools/autoloop/core/kickoff.sh)
         subjects = git(self.repo, "log", "--format=%s").splitlines()
         self.assertEqual(subjects[:2], ["fake work", "Merge main into autoloop/M1: Dependabot #12 Bump x from 1 to 2"])
         self.assertEqual(self.calls(), 1)
+
+    # Staging
+
+    def test_staging_runs_on_free_ports_follows_commits_and_stops_with_the_loop(self):
+        # A STAGING_UP that keeps running (two dev servers): started with the loop, started again after each
+        # of the first two commits (the third ends the loop), told once, stopped with the loop.
+        fake = FAKE_COMMIT.replace('echo x >> "$FAKE_COUNT"\n', 'echo x >> "$FAKE_COUNT"\necho "$STAGING_PORT_WEB" > "$FAKE_SEEN"\n')
+        env = self.staging_env(61100, FAKE_SEEN=str(self.tmp / "seen"))
+        result = self.run_loop(fake, MAX_ITERATIONS="3", STAGING_UP=STAGING_SERVE, STAGING_SERVICES="web api", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ports = self.ports()
+        self.assertEqual(sorted(ports), ["api", "web"])
+        self.assertGreaterEqual(min(ports.values()), 61100)
+        self.assertNotEqual(ports["web"], ports["api"])
+        start = git(self.repo, "rev-parse", "HEAD~3").strip()[:7]
+        self.assertIn(
+            f"telegram (not configured): autoloop: staging for M1 at {start}: web http://stage.invalid:{ports['web']}, "
+            f"api http://stage.invalid:{ports['api']}. It follows every commit; the services' output is in "
+            "tools/autoloop/log/staging.log.",
+            result.stdout,
+        )
+        # Every STAGING_UP got the same ports, and so did the runs.
+        self.assertEqual(self.staging_lines(), [f"up {ports['web']} {ports['api']}"] * 3)
+        self.assertEqual((self.tmp / "seen").read_text().strip(), str(ports["web"]))
+        self.assertEqual(result.stdout.count("staging refreshed at "), 2)
+        self.assertEqual(result.stdout.count("autoloop: staging"), 1)
+        self.assertNotIn("not answering", result.stdout)
+        self.assertEqual(self.read("tools/autoloop/log/staging.log").count(" up at "), 3)
+        self.assertIn("staging stopped with the loop", result.stdout)
+        self.assertFalse((self.loop / "log" / "staging.pid").exists())
+        for port in ports.values():
+            self.assertTrue(self.port_free(port), port)
+
+    def test_staging_tells_when_up_fails_and_a_service_stops_answering(self):
+        env = self.staging_env(61200)
+        result = self.run_loop(FAKE_COMMIT, MAX_ITERATIONS="2", STAGING_UP=STAGING_FAIL_SECOND, STAGING_SERVICES="web", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        port = self.ports()["web"]
+        start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
+        after = git(self.repo, "rev-parse", "HEAD~1").strip()[:7]
+        self.assertIn(f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout)
+        self.assertIn(
+            f"telegram (not configured): autoloop: staging at {after}: STAGING_UP exited 7 (compose: boom); "
+            f"web http://stage.invalid:{port} (not answering).",
+            result.stdout,
+        )
+        self.assertEqual(self.staging_lines(), ["up", "up"])
+        self.assertTrue(self.port_free(port))
+
+    def test_staging_skips_a_port_in_use_and_keeps_recorded_ports(self):
+        env = self.staging_env(61300, STAGING_READY_S="0")
+        with self.listening(61300):
+            result = self.run_loop(FAKE_COMMIT, "--once", STAGING_UP="true", STAGING_SERVICES="web api", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.ports(), {"web": 61301, "api": 61302})
+            self.assertIn(
+                "web http://stage.invalid:61301 (not answering), api http://stage.invalid:61302 (not answering).",
+                result.stdout,
+            )
+            # The same ports again while they are free.
+            result = self.run_loop(FAKE_COMMIT, "--once", STAGING_UP="true", STAGING_SERVICES="web api", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.ports(), {"web": 61301, "api": 61302})
+            # A recorded port that is taken, by another service or by the host, is replaced by the next free one.
+            (self.loop / "log" / "staging.ports").write_text("web 61302\napi 61302\n")
+            result = self.run_loop(FAKE_COMMIT, "--once", STAGING_UP="true", STAGING_SERVICES="web api", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.ports(), {"web": 61302, "api": 61301})
+
+    def test_staging_down_runs_before_the_first_up_and_at_exit_and_the_exit_code_stays(self):
+        self.write_progress(HEADER + "  - files: x\n" + TASK + LOG)
+        env = self.staging_env(61400, STAGING_READY_S="0")
+        result = self.run_loop(
+            FAKE_COMMIT, STAGING_UP='echo up >> "$FAKE_STAGING"', STAGING_DOWN='echo down >> "$FAKE_STAGING"', **env
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(self.staging_lines(), ["down", "up", "down"])
+        self.assertIn("autoloop: staging for M1 at ", result.stdout)
+        self.assertIn(": no service declared. It follows every commit", result.stdout)
+        self.assertEqual(self.calls(), 0)
+
+    def test_staging_detached_services_stay_until_down(self):
+        # A STAGING_UP that returns is not stopped between commits; STAGING_DOWN stops its server at exit.
+        env = self.staging_env(61500)
+        result = self.run_loop(
+            FAKE_COMMIT,
+            MAX_ITERATIONS="2",
+            STAGING_UP=STAGING_DETACH,
+            STAGING_DOWN='kill "$(cat "$FAKE_SERVER_PID")"',
+            STAGING_SERVICES="web",
+            **env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        port = self.ports()["web"]
+        start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
+        self.assertIn(f"autoloop: staging for M1 at {start}: web http://stage.invalid:{port}. It follows", result.stdout)
+        self.assertNotIn("not answering", result.stdout)
+        self.assertEqual(self.staging_lines(), ["up", "up"])
+        self.assertEqual(result.stdout.count("staging refreshed at "), 1)
+        self.assertTrue(self.port_free(port))
+
+    def test_dry_run_starts_no_staging(self):
+        env = self.staging_env(61600)
+        result = self.run_loop(FAKE_COMMIT, "--dry-run", STAGING_UP='echo up >> "$FAKE_STAGING"', STAGING_SERVICES="web", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dry-run: would start the staging (echo up >> "$FAKE_STAGING") for web', result.stdout)
+        self.assertEqual(self.staging_lines(), [])
+        self.assertFalse((self.loop / "log" / "staging.ports").exists())
+
+    def test_staging_settings_are_checked(self):
+        for env, message in (
+            ({"STAGING_SERVICES": "web api"}, "STAGING_SERVICES names web api but STAGING_UP is empty"),
+            ({"STAGING_UP": "true", "STAGING_SERVICES": "web 1api"}, "got '1api'"),
+            ({"STAGING_UP": "true", "STAGING_PORT_BASE": "70000"}, "STAGING_PORT_BASE must be a port number"),
+            ({"STAGING_UP": "true", "STAGING_READY_S": "soon"}, "STAGING_READY_S must be a number of seconds"),
+        ):
+            result = self.run_loop(None, "--print-stage", **env)
+            self.assertEqual(result.returncode, 3, env)
+            self.assertIn(message, result.stderr)
+
+    def test_status_report_carries_the_staging_urls(self):
+        log_dir = self.loop / "log"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "staging.ports").write_text("web 61700\napi 61701\n")
+        with self.listening(61700):
+            result = self.telegram("status-text", STAGING_HOST="stage.invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            result.stdout.endswith("staging: web http://stage.invalid:61700 (up), api http://stage.invalid:61701 (down)\n"),
+            result.stdout,
+        )
 
 
 if __name__ == "__main__":

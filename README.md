@@ -67,7 +67,13 @@ Dependabot   -> its pull requests on the base branch are looked at before every 
                 once, broken or unclear is told to the owner with the judge's reason, and it is never merged
                 while red; one the merge failed on and a base branch that conflicts are told to the owner
                 once and left; one still being checked waits
-telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, and gh
+staging      -> with STAGING_UP: the project's services run next to the loop on free ports, one per name in
+                STAGING_SERVICES (STAGING_PORT_<NAME>, the first free at or above STAGING_PORT_BASE, kept in
+                log/staging.ports), started with the loop and brought up to date after every commit; the
+                owner gets the URLs once and hears when a service stops answering or STAGING_UP fails;
+                STAGING_DOWN runs when the loop exits
+telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, gh and
+                log/staging.ports
 ```
 
 ## How a project uses it
@@ -81,7 +87,8 @@ telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log 
   hooks/rules.sh        optional: the project's own guard rules, sourced by the shared guard
   prompts/plan.md, task.md, verify.md   the project's master prompts (judge.md and dependabot.md optional; core's are the default)
   autoloop.env.example  the settings the project changes; autoloop.env (git-ignored) holds the real values
-  log/                  git-ignored: one JSON result per run, kickoff.log, judge.log, the CI logs, evidence
+  log/                  git-ignored: one JSON result per run, kickoff.log, judge.log, the CI logs, evidence,
+                        the staging's log and ports
   archive/<milestone>/  committed: each finished milestone's PROGRESS.md, QUESTIONS.md, pull request body, acceptance
 ```
 
@@ -163,9 +170,55 @@ The hourly status report (`telegram.sh status`, fired by the
 `<name>-status.timer` unit) carries the milestone, the task counts (open,
 in progress, reopened, done, and among the done ones how many still await
 their verify run), the number of open Dependabot pull requests when `gh`
-can list them, the commits since the last report and the judge's answers
-and passes since the last report; `log/status.last` remembers when the last
-one went out.
+can list them, the commits since the last report, the judge's answers
+and passes since the last report, and the staging's services with whether
+each answers when the loop has one; `log/status.last` remembers when the
+last one went out.
+
+## The staging: the services while the loop runs
+
+With `STAGING_UP` set in `autoloop.env`, the wrapper keeps the project's
+services running next to the loop, so you can open what it is building
+while it builds it. `STAGING_UP` is a command, run from the repository root
+with `bash -c`, that starts the services or brings them up to date:
+`docker compose -f compose.staging.yml up -d --build`, `make staging-up`,
+or a dev server such as `PORT=$STAGING_PORT_WEB npm run dev` (in single
+quotes in `autoloop.env`, so that the port is read when the command runs).
+It runs when the loop starts and again after every run that made a commit,
+and the staging follows the branch's head while a milestone's pull request
+waits for its merge. Each name in `STAGING_SERVICES` (`web api`) gets a
+free port, the first at or above `STAGING_PORT_BASE` (42000) that nothing on
+the host listens on, which `STAGING_UP` finds in `STAGING_PORT_<NAME>`
+(upper case, `-` as `_`): a compose file maps it with
+`ports: ["${STAGING_PORT_WEB}:3000"]`. The ports are kept in
+`log/staging.ports` and used again on every refresh and restart while they
+stay free, so the URLs do not change under you; another loop on the host, or
+your own stack on the usual ports, gets other ones.
+
+A `STAGING_UP` that returns has detached the services (compose); one that
+keeps running is the service itself and is stopped, with everything it
+started, before the next `STAGING_UP` and when the loop exits. Its output
+goes to `log/staging.log`. After each `STAGING_UP` the wrapper waits up to
+`STAGING_READY_S` seconds (120) for every service to accept a connection on
+its port, then tells you once, over Telegram, where they are:
+`staging for M3 at 1a2b3c4: web http://<host>:42000, api http://<host>:42001`,
+with `(not answering)` after a service that does not and
+`STAGING_UP exited <n>` with the log's last line when the command failed.
+Later refreshes are lines in `kickoff.log`; you hear of one only when
+something changed: a service stopped answering or answers again, or
+`STAGING_UP` failed. The hourly report carries the URLs with `(up)` or
+`(down)` after each. `STAGING_HOST` is the host in the URLs (default: the
+machine's hostname); the services must listen on all interfaces to be
+reached from elsewhere, and who may reach the host is yours to decide.
+
+`STAGING_DOWN` (`docker compose -f compose.staging.yml down`), when set, runs
+when the loop exits and before the first `STAGING_UP` of a start, so that
+the services of an earlier loop are gone and their ports free. Without it,
+detached services outlive the loop and the next start brings them up to
+date. The runs see `STAGING_PORT_<NAME>` and `STAGING_HOST` too, so a verify
+prompt can send the verifier to `http://127.0.0.1:$STAGING_PORT_WEB` (the
+guard lets loopback through); a dev server with hot reload shows the
+implementer's edits before they are committed. `--dry-run` starts nothing.
 
 ## Setting up on a new machine or account
 
@@ -178,7 +231,8 @@ one went out.
 3. `cp tools/autoloop/core/autoloop.env.example tools/autoloop/autoloop.env`
    (or the project's example) and fill the Telegram token and chat id. One
    bot per loop: two loops polling the same token consume each other's
-   answers.
+   answers. `STAGING_UP` and `STAGING_SERVICES` keep the project's services
+   reachable while the loop runs ("The staging" above).
 4. Dry run: `tools/autoloop/kickoff.sh --dry-run`; one stage:
    `tools/autoloop/kickoff.sh --once`; the next stage without running it:
    `tools/autoloop/kickoff.sh --print-stage`.
@@ -225,7 +279,7 @@ defined.
 
 | File | Role |
 |---|---|
-| `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request, Dependabot's pull requests |
+| `kickoff.sh` | the loop: stage choice, invocation, the judge, usage-limit wait, no-progress guard, branch, pull request, Dependabot's pull requests, the staging |
 | `telegram.sh` | `send <text>`, `status`, `status-text`, `photo`, `video`, `file`; silent no-op without a token |
 | `qa.py` | `list` the open questions, `send` them, `wait` for answers over Telegram (or `--from-file` in tests), `judged` and `judge-log` for the judge's bookkeeping |
 | `ci_task.py` | writes the "Make CI green" task into PROGRESS.md when a pull request check fails; its acceptance is `CI_FIX_ACCEPTANCE` and then the innermost failed make target of each failed job |
@@ -255,7 +309,9 @@ whose check is red goes to the judge first, which has a flaky check run
 again once and tells you, with its reason, about an update that breaks the
 build or that it cannot call; that one, one the loop could not merge (a
 required review, a forbidden merge method) and a base branch that no longer
-merges cleanly are told to you once and left alone. Keep `MILESTONES.md` honest when the plan
+merges cleanly are told to you once and left alone. Open the staging's URLs
+from the Telegram message or the hourly report to see what the loop has built
+so far; they stay the same while it runs. Keep `MILESTONES.md` honest when the plan
 changes. The loop's prompts do not push; the wrapper pushes the milestone
 branch when the milestone is done, and again when the base branch was
 merged into it while its pull request waits.
