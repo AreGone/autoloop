@@ -71,7 +71,8 @@ staging      -> with STAGING_UP: the project's services run next to the loop on 
                 STAGING_SERVICES (STAGING_PORT_<NAME>, the first free at or above STAGING_PORT_BASE, kept in
                 log/staging.ports), started with the loop and brought up to date after every commit; the
                 owner gets the URLs once and hears when a service stops answering or STAGING_UP fails;
-                STAGING_DOWN runs when the loop exits
+                STAGING_DOWN runs when the loop exits; STAGING_CHECK runs after each STAGING_UP and is
+                let finish before the next one
 telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, gh and
                 log/staging.ports
 ```
@@ -217,7 +218,22 @@ reached from elsewhere, and who may reach the host is yours to decide.
 when the loop exits and before the first `STAGING_UP` of a start, so that
 the services of an earlier loop are gone and their ports free. Without it,
 detached services outlive the loop and the next start brings them up to
-date. The runs see `STAGING_PORT_<NAME>` and `STAGING_HOST` too, so a verify
+date.
+
+`STAGING_CHECK`, when set, is a command run against the staging (an
+end-to-end test, a smoke script) after each `STAGING_UP` that brought it up:
+in the background, from the repository root, with the same ports and its
+output in `log/staging.log`. It starts once `STAGING_UP` has returned and
+every service answers, so a rebuild whose old containers still answer is
+not checked early; for a `STAGING_UP` that keeps running it starts after
+`STAGING_READY_S`. The next `STAGING_UP` waits up to `STAGING_CHECK_S`
+seconds (900) for it to finish instead of stopping it, and stops it only
+past that; its result (`staging check at <sha> passed` or `failed (exit
+<n>)`) is a line in `kickoff.log`. A check chained onto `STAGING_UP` with
+`&&` is part of the service and is stopped by the next commit's refresh;
+put it here instead.
+
+The runs see `STAGING_PORT_<NAME>` and `STAGING_HOST` too, so a verify
 prompt can send the verifier to `http://127.0.0.1:$STAGING_PORT_WEB` (the
 guard lets loopback through); a dev server with hot reload shows the
 implementer's edits before they are committed. `--dry-run` starts nothing.

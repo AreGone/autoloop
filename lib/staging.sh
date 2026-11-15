@@ -3,7 +3,8 @@
 # The staging: the project's services, up next to the loop so that the owner can open what it
 # builds. STAGING_UP (autoloop.env) starts them or brings them up to date; it runs when the loop
 # starts and again after every commit, with STAGING_PORT_<NAME> set for every name in
-# STAGING_SERVICES.
+# STAGING_SERVICES. STAGING_CHECK, when set, runs against them after each STAGING_UP that brought
+# them up, in the background, and is let finish before the next STAGING_UP.
 #
 # Part of the autoloop core: kickoff.sh sources this file from its own checkout (lib/staging.sh) after
 # the settings; log, notify, progress_field, prompt_file and invoke are kickoff.sh's. Not a program
@@ -123,15 +124,17 @@ process_start() {
 }
 
 #######################################
-# Stop the STAGING_UP of the last call when it still runs (it is the service, a dev server): TERM
-# to its process group, KILL after ten seconds. The pid file names the process and when it
-# started; a pid that now belongs to another process is only forgotten.
+# Stop the process a pid file names, when it still runs: TERM to its process group, KILL after ten
+# seconds. The pid file names the process and when it started; a pid that now belongs to another
+# process is only forgotten.
+# Arguments:
+#   The pid file.
 #######################################
-staging_kill_up() {
+staging_kill_group() {
   local pid started
-  [[ -f "${STAGING_PID}" ]] || return 0
-  read -r pid started < "${STAGING_PID}" || return 0
-  rm -f "${STAGING_PID}"
+  [[ -f "$1" ]] || return 0
+  read -r pid started < "$1" || return 0
+  rm -f "$1"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null || return 0
   [[ "$(process_start "${pid}")" == "${started:-}" ]] || return 0
   kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
@@ -143,13 +146,84 @@ staging_kill_up() {
 }
 
 #######################################
+# Stop the STAGING_UP of the last call when it still runs (it is the service, a dev server).
+#######################################
+staging_kill_up() {
+  staging_kill_group "${STAGING_PID}"
+}
+
+#######################################
+# Start STAGING_CHECK in the background, against the services STAGING_UP just brought up: from the
+# repository root, in a session of its own, with the ports in its environment and its output
+# appended to log/staging.log. Its pid and start time go to log/staging-check.pid.
+# Globals:
+#   staging_check_head: the commit the check runs against.
+#######################################
+staging_check_start() {
+  local setsid="" pid
+  staging_check_head="${staging_head}"
+  echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ) check at ${staging_head:0:7}: ${STAGING_CHECK}" >> "${STAGING_LOG}"
+  command -v setsid >/dev/null 2>&1 && setsid=setsid
+  # shellcheck disable=SC2086
+  (cd "${REPO_ROOT}" && exec ${setsid} bash -c "${STAGING_CHECK}") >> "${STAGING_LOG}" 2>&1 < /dev/null &
+  pid=$!
+  echo "${pid} $(process_start "${pid}")" > "${STAGING_CHECK_PID}"
+  log "staging check started at ${staging_head:0:7}"
+}
+
+#######################################
+# When the STAGING_CHECK this loop started has finished: its result as a line in kickoff.log, and the
+# pid file removed. A check of an earlier loop (not this shell's child) is left to staging_kill_group.
+# Returns:
+#   0 no check runs any more, 1 the check still runs.
+#######################################
+staging_check_reap() {
+  local pid started rc=0
+  [[ -f "${STAGING_CHECK_PID}" ]] || return 0
+  read -r pid started < "${STAGING_CHECK_PID}" || { rm -f "${STAGING_CHECK_PID}"; return 0; }
+  if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null \
+    && [[ "$(process_start "${pid}")" == "${started:-}" ]]; then
+    return 1
+  fi
+  rm -f "${STAGING_CHECK_PID}"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 0
+  wait "${pid}" 2>/dev/null || rc=$?
+  if (( rc == 0 )); then
+    log "staging check at ${staging_check_head:0:7} passed"
+  else
+    log "staging check at ${staging_check_head:0:7} failed (exit ${rc}); see ${STAGING_LOG}"
+  fi
+  return 0
+}
+
+#######################################
+# Before the next STAGING_UP: wait up to STAGING_CHECK_S seconds for a running STAGING_CHECK to
+# finish, so that a refresh never cuts it short; one that runs longer is stopped, and the log says so.
+#######################################
+staging_check_finish() {
+  local waited=0
+  until staging_check_reap; do
+    if (( waited >= STAGING_CHECK_S )); then
+      log "staging check at ${staging_check_head:0:7} still ran after ${STAGING_CHECK_S}s; stopped"
+      staging_kill_group "${STAGING_CHECK_PID}"
+      return 0
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+}
+
+#######################################
 # Start the services, or bring them up to date with HEAD. A STAGING_UP of the last call that still
 # runs is stopped first. STAGING_UP runs in the background from the repository root, in a session
 # of its own so that it can be stopped with everything it started, with the ports in its
 # environment and its output appended to log/staging.log; the wrapper then waits until every
 # service answers on its port, STAGING_UP fails, or STAGING_READY_S seconds have passed. A
 # STAGING_UP that returns (docker compose up -d) has detached the services; one that keeps
-# running (a dev server) is left running until the next call or the exit.
+# running (a dev server) is left running until the next call or the exit. A STAGING_CHECK of the
+# last call is let finish first. With STAGING_CHECK set, services that answer are not enough while
+# STAGING_UP still runs (the old ones may answer during a rebuild): the wait goes on until it
+# returns or STAGING_READY_S has passed, and then the check starts when every service answers.
 # Globals:
 #   staging_head: the commit staged. staging_state: the services with their URLs, the ones that
 #   do not answer marked, after what went wrong when STAGING_UP failed.
@@ -158,6 +232,7 @@ staging_kill_up() {
 #######################################
 staging_up() {
   local pid rc=0 waited=0 unready="" setsid=""
+  staging_check_finish
   staging_kill_up
   staging_head="$(git rev-parse HEAD)"
   echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ) up at ${staging_head:0:7}: ${STAGING_UP}" >> "${STAGING_LOG}"
@@ -174,7 +249,7 @@ staging_up() {
       (( rc == 0 )) || break
     fi
     unready="$(staging_unready)"
-    [[ -n "${unready}" ]] || break
+    [[ -n "${unready}" || ( -n "${STAGING_CHECK}" && -n "${pid}" ) ]] || break
     (( waited < STAGING_READY_S )) || break
     sleep 1
     waited=$(( waited + 1 ))
@@ -185,7 +260,8 @@ staging_up() {
     staging_state="STAGING_UP exited ${rc} ($(tail -1 "${STAGING_LOG}" | cut -c1-200)); ${staging_state}"
     return 1
   fi
-  [[ -z "${unready}" ]]
+  [[ -z "${unready}" ]] || return 1
+  [[ -z "${STAGING_CHECK}" ]] || staging_check_start
 }
 
 #######################################
@@ -202,6 +278,7 @@ staging_start() {
     return 0
   fi
   trap staging_stop EXIT
+  staging_kill_group "${STAGING_CHECK_PID}"
   staging_down
   staging_allocate
   staging_up || true
@@ -216,6 +293,7 @@ staging_start() {
 # failed), not on every commit; every refresh is a line in kickoff.log.
 #######################################
 staging_sync() {
+  [[ -z "${STAGING_CHECK}" ]] || staging_check_reap || true
   [[ -n "${staging_head:-}" && "$(git rev-parse HEAD)" != "${staging_head}" ]] || return 0
   staging_up || true
   log "staging refreshed at ${staging_head:0:7}: ${staging_state}"
@@ -239,10 +317,11 @@ staging_down() {
 }
 
 #######################################
-# At exit: stop a STAGING_UP that still runs, then STAGING_DOWN. Detached services of a project
+# At exit: stop a STAGING_CHECK and a STAGING_UP that still run, then STAGING_DOWN. Detached services of a project
 # without STAGING_DOWN stay up; the next start brings them up to date.
 #######################################
 staging_stop() {
+  staging_kill_group "${STAGING_CHECK_PID}"
   staging_kill_up
   staging_down
   log "staging stopped with the loop"

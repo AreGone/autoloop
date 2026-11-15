@@ -191,6 +191,10 @@ STAGING_DETACH = (
     'python3 -m http.server "$STAGING_PORT_WEB" --bind 127.0.0.1 >/dev/null 2>&1 & echo $! > "$FAKE_SERVER_PID"; fi; '
     'echo up >> "$FAKE_STAGING"'
 )
+# A STAGING_UP that detaches its server at once and returns two seconds later (a compose build while
+# the old containers answer), and a STAGING_CHECK that takes two seconds and records the port it saw.
+STAGING_DETACH_SLOW = STAGING_DETACH + '; sleep 2; echo built >> "$FAKE_STAGING"'
+STAGING_CHECK_SLOW = 'sleep 2; echo "check $STAGING_PORT_WEB" >> "$FAKE_STAGING"'
 STAGING_FAIL_SECOND = (
     'echo up >> "$FAKE_STAGING"; if [ "$(wc -l < "$FAKE_STAGING")" -ge 2 ]; then echo "compose: boom"; exit 7; fi; '
     'exec python3 -m http.server "$STAGING_PORT_WEB" --bind 127.0.0.1'
@@ -383,6 +387,7 @@ MERGE_POLL_S=1; CHECK_POLL_S=1; CI_REOPEN_LIMIT=${{CI_REOPEN_LIMIT:-3}}; CI_FIX_
 LOCAL_GATE="${{LOCAL_GATE:-true}}"; LOCAL_GATE_TIMEOUT_S=60
 GIT_REMOTE=origin; BASE_BRANCH=main; DEPENDABOT_MERGE=${{DEPENDABOT_MERGE:-squash}}
 DEPENDABOT_TRIAGE=${{DEPENDABOT_TRIAGE:-judge}}; JUDGE_MODEL=opus; JUDGE_MAX_TURNS=40; JUDGE_LOG={log_dir}/judge.log
+STAGING_CHECK=""; STAGING_CHECK_S=900; STAGING_CHECK_PID={log_dir}/staging-check.pid
 log() {{ echo "LOG: $*"; }}
 notify() {{ echo "NOTIFY: $*"; }}
 prompt_file() {{ echo "$HERE/prompts/$1.md"; }}
@@ -1525,6 +1530,51 @@ exit "$rc"
         self.assertEqual(result.stdout.count("staging refreshed at "), 1)
         self.assertTrue(self.port_free(port))
 
+    def test_staging_check_starts_after_up_returns_and_the_next_refresh_waits_for_it(self):
+        # The service answers before STAGING_UP returns; the check still starts only after it returned.
+        # The second commit's refresh waits for the first check instead of stopping it; the second
+        # check is stopped with the loop.
+        env = self.staging_env(61800, STAGING_READY_S="10")
+        result = self.run_loop(
+            FAKE_COMMIT,
+            MAX_ITERATIONS="2",
+            STAGING_UP=STAGING_DETACH_SLOW,
+            STAGING_CHECK=STAGING_CHECK_SLOW,
+            STAGING_DOWN='kill "$(cat "$FAKE_SERVER_PID")"',
+            STAGING_SERVICES="web",
+            **env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        port = self.ports()["web"]
+        self.assertEqual(self.staging_lines(), ["up", "built", f"check {port}", "up", "built"])
+        start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
+        self.assertIn(f"staging check at {start} passed", result.stdout)
+        self.assertEqual(result.stdout.count("staging check started at "), 2)
+        self.assertEqual(self.read("tools/autoloop/log/staging.log").count(" check at "), 2)
+        self.assertFalse((self.loop / "log" / "staging-check.pid").exists())
+        self.assertTrue(self.port_free(port))
+
+    def test_staging_check_that_fails_or_runs_too_long_is_logged(self):
+        env = self.staging_env(61900, STAGING_READY_S="0")
+        result = self.run_loop(FAKE_COMMIT, MAX_ITERATIONS="2", STAGING_UP="true", STAGING_CHECK="exit 4", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
+        self.assertIn(f"staging check at {start} failed (exit 4); see ", result.stdout)
+        result = self.run_loop(
+            FAKE_COMMIT,
+            MAX_ITERATIONS="2",
+            STAGING_UP="true",
+            STAGING_CHECK='sleep 30; echo late >> "$FAKE_STAGING"',
+            STAGING_CHECK_S="1",
+            **env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start = git(self.repo, "rev-parse", "HEAD~2").strip()[:7]
+        self.assertIn(f"staging check at {start} still ran after 1s; stopped", result.stdout)
+        self.assertEqual(self.staging_lines(), [])
+        self.assertFalse((self.loop / "log" / "staging-check.pid").exists())
+
     def test_dry_run_starts_no_staging(self):
         env = self.staging_env(61600)
         result = self.run_loop(
@@ -1541,6 +1591,8 @@ exit "$rc"
             ({"STAGING_UP": "true", "STAGING_SERVICES": "web 1api"}, "got '1api'"),
             ({"STAGING_UP": "true", "STAGING_PORT_BASE": "70000"}, "STAGING_PORT_BASE must be a port number"),
             ({"STAGING_UP": "true", "STAGING_READY_S": "soon"}, "STAGING_READY_S must be a number of seconds"),
+            ({"STAGING_CHECK": "true"}, "STAGING_CHECK is set but STAGING_UP is empty"),
+            ({"STAGING_UP": "true", "STAGING_CHECK_S": "later"}, "STAGING_CHECK_S must be a number of seconds"),
         ):
             result = self.run_loop(None, "--print-stage", **env)
             self.assertEqual(result.returncode, 3, env)

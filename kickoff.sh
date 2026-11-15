@@ -82,7 +82,11 @@ readonly DEPENDABOT_TRIAGE="${DEPENDABOT_TRIAGE:-judge}"
 # The project's services while the loop runs (a staging the owner can open): STAGING_UP starts them
 # or brings them up to date with STAGING_PORT_<NAME> set to a free port for every name in
 # STAGING_SERVICES; empty means no staging. STAGING_DOWN stops them when the loop exits.
+# STAGING_CHECK runs against them after each STAGING_UP that brought them up, in the background; the
+# next STAGING_UP waits up to STAGING_CHECK_S seconds for it to finish instead of stopping it.
 readonly STAGING_UP="${STAGING_UP:-}"
+readonly STAGING_CHECK="${STAGING_CHECK:-}"
+readonly STAGING_CHECK_S="${STAGING_CHECK_S:-900}"
 readonly STAGING_DOWN="${STAGING_DOWN:-}"
 readonly STAGING_SERVICES="${STAGING_SERVICES:-}"
 readonly STAGING_PORT_BASE="${STAGING_PORT_BASE:-42000}"
@@ -110,10 +114,11 @@ mkdir -p "${LOG_DIR}"
 readonly RUN_LOG="${LOG_DIR}/kickoff.log"
 readonly JUDGE_LOG="${LOG_DIR}/judge.log"
 # The staging's ports ("<name> <port>" lines), the output of STAGING_UP and STAGING_DOWN, and the
-# pid (with its start time) of a STAGING_UP that keeps running.
+# pid (with its start time) of a STAGING_UP that keeps running and of a STAGING_CHECK that runs.
 readonly STAGING_PORTS="${LOG_DIR}/staging.ports"
 readonly STAGING_LOG="${LOG_DIR}/staging.log"
 readonly STAGING_PID="${LOG_DIR}/staging.pid"
+readonly STAGING_CHECK_PID="${LOG_DIR}/staging-check.pid"
 
 # The parts of the loop that do not choose stages, sourced from this checkout: they use the settings
 # above and the functions below (log, notify, progress_field, prompt_file, invoke).
@@ -396,6 +401,14 @@ check_settings() {
   fi
   if [[ ! "${STAGING_READY_S}" =~ ^[0-9]+$ ]]; then
     echo "STAGING_READY_S must be a number of seconds, got '${STAGING_READY_S}'" >&2
+    exit 3
+  fi
+  if [[ -n "${STAGING_CHECK}" && -z "${STAGING_UP}" ]]; then
+    echo "STAGING_CHECK is set but STAGING_UP is empty: a check needs the staging it runs against" >&2
+    exit 3
+  fi
+  if [[ ! "${STAGING_CHECK_S}" =~ ^[0-9]+$ ]]; then
+    echo "STAGING_CHECK_S must be a number of seconds, got '${STAGING_CHECK_S}'" >&2
     exit 3
   fi
 }
