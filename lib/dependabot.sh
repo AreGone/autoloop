@@ -58,7 +58,7 @@ dependabot_triage() {
   (( rc == 0 )) || return 1
   # The newest result file; the names are timestamps.
   # shellcheck disable=SC2012
-  result="$(ls -t "${LOG_DIR}"/*-dependabot.json 2>/dev/null | head -1)"
+  result="$(ls -t "${LOG_DIR}"/*-dependabot.json 2>/dev/null | sed -n 1p || true)"
   python3 -I "${HERE}/result.py" verdict "${result}"
 }
 

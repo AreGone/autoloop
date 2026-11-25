@@ -267,7 +267,8 @@ staging_up() {
 #######################################
 # Bring the staging up when the loop starts, for a project with STAGING_UP: STAGING_DOWN first,
 # when set, so that services of an earlier loop are gone and their ports free; then the ports,
-# STAGING_UP, and the owner gets the URLs. The staging is stopped when the loop exits.
+# STAGING_UP, and the owner gets the URLs. The staging is stopped when the loop exits, unless
+# STAGING_KEEP=1 leaves it up.
 #######################################
 staging_start() {
   [[ -n "${STAGING_UP}" ]] || return 0
@@ -317,12 +318,17 @@ staging_down() {
 }
 
 #######################################
-# At exit: stop a STAGING_CHECK and a STAGING_UP that still run, then STAGING_DOWN. Detached services of a project
-# without STAGING_DOWN stay up; the next start brings them up to date.
+# At exit: stop a STAGING_CHECK and a STAGING_UP that still run, then STAGING_DOWN. With
+# STAGING_KEEP=1, or without STAGING_DOWN, detached services stay up and keep showing the last
+# commit staged; the next start takes them down (STAGING_DOWN) and brings them up to date.
 #######################################
 staging_stop() {
   staging_kill_group "${STAGING_CHECK_PID}"
   staging_kill_up
+  if [[ "${STAGING_KEEP}" == "1" ]]; then
+    log "staging left up at ${staging_head:0:7} (STAGING_KEEP=1)"
+    return 0
+  fi
   staging_down
   log "staging stopped with the loop"
 }

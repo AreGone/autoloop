@@ -135,7 +135,9 @@ archive_milestone() {
   cp "${PROGRESS}" "${dir}/PROGRESS.md"
   cp "${QUESTIONS}" "${dir}/QUESTIONS.md"
   write_pr_body "${dir}/PULL_REQUEST.md"
-  latest_plan="$(ls -t "${LOG_DIR}"/*-plan.json 2>/dev/null | head -1)"
+  # sed reads the whole list: head would close the pipe early, and under systemd (SIGPIPE ignored) ls
+  # then fails on the write and takes the loop down with it.
+  latest_plan="$(ls -t "${LOG_DIR}"/*-plan.json 2>/dev/null | sed -n 1p || true)"
   if [[ -n "${latest_plan}" ]]; then
     python3 -I "${HERE}/result.py" text "${latest_plan}" > "${dir}/ACCEPTANCE.md" 2>/dev/null || true
   fi

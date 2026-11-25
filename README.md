@@ -67,11 +67,16 @@ Dependabot   -> its pull requests on the base branch are looked at before every 
                 once, broken or unclear is told to the owner with the judge's reason, and it is never merged
                 while red; one the merge failed on and a base branch that conflicts are told to the owner
                 once and left; one still being checked waits
+base branch  -> fetched before every run, on every poll while a milestone's pull request waits and every
+                MERGE_POLL_S while the loop waits for an answer: when it moved (a push, a pull request
+                merged by hand) it is merged into the milestone branch, pushed when the milestone's pull
+                request is open, so the runs and the staging carry everything on it; uncommitted work of
+                a run postpones the merge to the next pass; a conflict is told once and left
 staging      -> with STAGING_UP: the project's services run next to the loop on free ports, one per name in
                 STAGING_SERVICES (STAGING_PORT_<NAME>, the first free at or above STAGING_PORT_BASE, kept in
                 log/staging.ports), started with the loop and brought up to date after every commit; the
                 owner gets the URLs once and hears when a service stops answering or STAGING_UP fails;
-                STAGING_DOWN runs when the loop exits; STAGING_CHECK runs after each STAGING_UP and is
+                STAGING_DOWN runs when the loop exits (not with STAGING_KEEP=1); STAGING_CHECK runs after each STAGING_UP and is
                 let finish before the next one
 telegram.sh status (the hourly timer) reads PROGRESS.md, git log, log/judge.log since the last report, gh and
                 log/staging.ports
@@ -218,7 +223,17 @@ reached from elsewhere, and who may reach the host is yours to decide.
 when the loop exits and before the first `STAGING_UP` of a start, so that
 the services of an earlier loop are gone and their ports free. Without it,
 detached services outlive the loop and the next start brings them up to
-date.
+date. `STAGING_KEEP=1` keeps `STAGING_DOWN` for the start only: when the loop
+exits (a finished milestone list, a block nobody answered, a stop of the
+service) the detached services stay up on the last commit staged, and the
+next start takes them down and brings them up to date.
+
+The staging shows the milestone branch, and the milestone branch carries
+the base branch: whenever the base branch moves, the loop merges it in at
+its next pass ("base branch" in the table above) and the staging follows
+that merge like any other commit. A base branch that conflicts with the
+milestone is told to you once; until you merge it by hand the staging shows
+the milestone without it.
 
 `STAGING_CHECK`, when set, is a command run against the staging (an
 end-to-end test, a smoke script) after each `STAGING_UP` that brought it up:
@@ -326,7 +341,8 @@ the merge, then starts the next milestone by itself; closing the pull
 request unmerged stops the loop. Dependabot's pull requests are the loop's
 too: one whose checks are green is merged for you (`DEPENDABOT_MERGE`,
 squash by default; `report` leaves the merge to you, `ignore` leaves them
-all alone) and the base branch is merged into the milestone branch; one
+all alone) and the base branch is merged into the milestone branch, as it
+is after anything else that lands on it; one
 whose check is red goes to the judge first, which has a flaky check run
 again once and tells you, with its reason, about an update that breaks the
 build or that it cannot call; that one, one the loop could not merge (a

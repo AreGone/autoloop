@@ -193,6 +193,11 @@ STAGING_DETACH = (
 )
 # A STAGING_UP that detaches its server at once and returns two seconds later (a compose build while
 # the old containers answer), and a STAGING_CHECK that takes two seconds and records the port it saw.
+# A STAGING_DOWN for it: stops the server and waits until it is gone.
+STAGING_KILL = (
+    'echo down >> "$FAKE_STAGING"; pid="$(cat "$FAKE_SERVER_PID" 2>/dev/null || true)"; '
+    'if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done; fi'
+)
 STAGING_DETACH_SLOW = STAGING_DETACH + '; sleep 2; echo built >> "$FAKE_STAGING"'
 STAGING_CHECK_SLOW = 'sleep 2; echo "check $STAGING_PORT_WEB" >> "$FAKE_STAGING"'
 STAGING_FAIL_SECOND = (
@@ -254,6 +259,8 @@ class WrapperTest(unittest.TestCase):
         (self.bin / "gh").chmod(0o755)
         self.merged = self.tmp / "merged"
         self.rerun = self.tmp / "rerun"
+        # False runs the wrapper with SIGPIPE ignored, as systemd starts a service.
+        self.restore_signals = True
 
     def add_remote(self) -> Path:
         """Gives the repository a bare origin holding main, at the initial commit, and the milestone branch."""
@@ -299,6 +306,7 @@ class WrapperTest(unittest.TestCase):
             text=True,
             timeout=120,
             check=False,
+            restore_signals=self.restore_signals,
         )
 
     def calls(self) -> int:
@@ -504,6 +512,25 @@ exit "$rc"
         self.assertTrue(text.endswith("\n"))
         self.assertEqual(self.call("archive_milestone", **env).returncode, 0)
         self.assertEqual(history.read_text(), text)
+
+    def test_archive_survives_many_result_files_with_sigpipe_ignored(self):
+        # Under systemd SIGPIPE is ignored: a reader that closes the pipe early makes ls fail on its write,
+        # and with pipefail that ended the loop (exit 2) right after "milestone done".
+        log = self.loop / "log"
+        log.mkdir()
+        for n in range(3000):
+            (log / f"20261101T{n:06d}Z-plan.json").write_text('{"is_error": false, "result": "accepted"}')
+        self.write_progress(DONE_HEADER + TASK.replace("- [ ]", "- [x]") + LOG)
+        git(self.repo, "commit", "-q", "-am", "done")
+        self.restore_signals = False
+        result = self.run_loop(FAKE_COMMIT)
+        # No remote: the archive is committed, then the push fails, which is the exit 3 of a failed pull request.
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("DONE but the push or pull request failed", result.stdout)
+        self.assertEqual(
+            git(self.repo, "log", "-1", "--format=%s"), "Archive M1: working files, pull request body, acceptance\n"
+        )
+        self.assertEqual(self.read("tools/autoloop/archive/M1/ACCEPTANCE.md").strip(), "accepted")
 
     # Stage choice
 
@@ -1420,6 +1447,130 @@ exit "$rc"
         self.assertEqual(subjects[:2], ["fake work", "Merge main into autoloop/M1: Dependabot #12 Bump x from 1 to 2"])
         self.assertEqual(self.calls(), 1)
 
+    # The base branch
+
+    def test_base_branch_that_moved_is_merged_before_the_next_run_but_not_in_a_dry_run(self):
+        self.add_remote()
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "branch work")
+        landed = self.land_on_main("lock.txt", "2\n")
+        dry = self.run_loop(FAKE_COMMIT, "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertFalse((self.repo / "lock.txt").exists())
+        result = self.run_loop(FAKE_COMMIT, "--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.merges(), [])
+        what = f"Bump x from 1 to 2 (lock.txt) ({landed[:7]})"
+        self.assertIn(f"merged main into autoloop/M1 ({what})", result.stdout)
+        self.assertEqual(self.read("lock.txt"), "2\n")
+        subjects = git(self.repo, "log", "--format=%s").splitlines()
+        self.assertEqual(subjects[:2], ["fake work", f"Merge main into autoloop/M1: {what}"])
+        # Nothing new on main: the next pass merges nothing.
+        again = self.run_loop(FAKE_COMMIT, "--once")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("merged main", again.stdout)
+
+    def test_base_branch_is_not_followed_without_a_remote(self):
+        result = self.call("follow_base_branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout + result.stderr, "")
+
+    def test_moved_base_branch_that_conflicts_is_told_once(self):
+        self.add_remote()
+        landed = self.land_on_main("HISTORY.md", "# History\n- main's line\n")
+        (self.repo / "HISTORY.md").write_text("# History\n- the branch's line\n")
+        git(self.repo, "commit", "-q", "-am", "branch history")
+        head = git(self.repo, "rev-parse", "HEAD")
+        result = self.call("follow_base_branch; follow_base_branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.count(
+                "NOTIFY: autoloop: main does not merge cleanly into autoloop/M1 after Bump x from 1 to 2 "
+                f"(HISTORY.md) ({landed[:7]}); merge it by hand before the milestone's pull request."
+            ),
+            1,
+        )
+        self.assertEqual(result.stdout.count("NOTIFY:"), 1)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
+    def test_moved_base_branch_waits_for_uncommitted_changes(self):
+        self.add_remote()
+        landed = self.land_on_main("lock.txt", "2\n")
+        (self.repo / "HISTORY.md").write_text("# History\n- a run's unfinished edit\n")
+        head = git(self.repo, "rev-parse", "HEAD")
+        result = self.call("follow_base_branch; follow_base_branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f"LOG: main moved to {landed[:7]}; merged in once the uncommitted changes are committed or reverted\n",
+        )
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.read("HISTORY.md"), "# History\n- a run's unfinished edit\n")
+        git(self.repo, "commit", "-q", "-am", "the run's edit")
+        result = self.call("follow_base_branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LOG: merged main into autoloop/M1", result.stdout)
+        self.assertEqual(self.read("lock.txt"), "2\n")
+
+    def test_waiting_pull_request_is_pushed_after_the_base_branch_moved(self):
+        remote = self.add_remote()
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        git(self.repo, "commit", "-q", "-am", "done")
+        git(self.repo, "push", "-q", "origin", "autoloop/M1")
+        old_head = git(self.repo, "rev-parse", "HEAD").strip()
+        self.land_on_main("lock.txt", "2\n")
+        # The pull request's head stays the old commit for gh, so no check is ever read: the wait times out.
+        result = self.call("wait_for_pr", timeout=4, FAKE_HEAD=old_head)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        new_head = git(self.repo, "rev-parse", "HEAD").strip()
+        self.assertNotEqual(new_head, old_head)
+        self.assertIn(
+            f"LOG: pushed autoloop/M1 at {new_head[:7]} with main merged in; watching its checks again", result.stdout
+        )
+        self.assertEqual(git(remote, "rev-parse", "autoloop/M1").strip(), new_head)
+        self.assertEqual(result.stdout.count("LOG: pushed"), 1)
+        self.assertEqual(self.merges(), [])
+
+    def test_wait_for_answers_follows_the_base_branch_between_slices(self):
+        # qa.py is replaced by one that times out twice and then has the answers; the function is the wrapper's.
+        fake = self.tmp / "fakeqa"
+        fake.mkdir()
+        (fake / "qa.py").write_text(
+            "import pathlib, sys\n"
+            "count = pathlib.Path(__file__).with_name('calls')\n"
+            "if sys.argv[1] == 'list':\n"
+            "    print('3')\n"
+            "    sys.exit(0)\n"
+            "n = int(count.read_text()) + 1 if count.exists() else 1\n"
+            "count.write_text(str(n))\n"
+            "print(f'wait {sys.argv[3]}')\n"
+            "if n < 3:\n"
+            "    print('timeout waiting for answers')\n"
+            "    sys.exit(3)\n"
+            "print('recorded Q3')\n"
+        )
+        script = (
+            f"set -euo pipefail; HERE={fake}; MERGE_POLL_S=1; "
+            "follow_base_branch() { echo follow; }; staging_sync() { echo sync; }; "
+            f"""eval "$(sed -n '/^wait_for_answers() {{/,/^}}/p' {self.loop}/core/kickoff.sh)"; """
+            'rc=0; wait_for_answers || rc=$?; echo "rc $rc"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], env={**os.environ, "ANSWER_WAIT_S": "60"}, capture_output=True, text=True
+        )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["wait 1", "follow", "sync", "wait 1", "follow", "sync", "wait 1", "recorded Q3", "rc 0"],
+            result.stderr,
+        )
+        # No answer by the deadline is qa.py's timeout, with nothing followed after it.
+        (fake / "calls").unlink()
+        result = subprocess.run(
+            ["bash", "-c", script], env={**os.environ, "ANSWER_WAIT_S": "0"}, capture_output=True, text=True
+        )
+        self.assertEqual(result.stdout.splitlines(), ["wait 0", "rc 3"], result.stderr)
+
     # Staging
 
     def test_staging_runs_on_free_ports_follows_commits_and_stops_with_the_loop(self):
@@ -1507,6 +1658,24 @@ exit "$rc"
         self.assertIn(": no service declared. It follows every commit", result.stdout)
         self.assertEqual(self.calls(), 0)
 
+    def test_staging_keep_leaves_the_services_up_at_exit_and_the_next_start_takes_them_down(self):
+        env = self.staging_env(61450, STAGING_KEEP="1")
+        settings = {"STAGING_UP": STAGING_DETACH, "STAGING_DOWN": STAGING_KILL, "STAGING_SERVICES": "web", **env}
+        result = self.run_loop(FAKE_COMMIT, "--once", **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        port = self.ports()["web"]
+        self.addCleanup(lambda: subprocess.run(["bash", "-c", STAGING_KILL], env={**os.environ, **env}, check=False))
+        self.assertEqual(self.staging_lines(), ["down", "up"])
+        self.assertIn("staging left up at ", result.stdout)
+        self.assertNotIn("staging stopped with the loop", result.stdout)
+        self.assertFalse(self.port_free(port))
+        # The next start takes the kept services down first, so the recorded port is free and stays theirs.
+        result = self.run_loop(FAKE_COMMIT, "--once", **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ports()["web"], port)
+        self.assertEqual(self.staging_lines(), ["down", "up", "down", "up"])
+        self.assertNotIn("not answering", result.stdout)
+
     def test_staging_detached_services_stay_until_down(self):
         # A STAGING_UP that returns is not stopped between commits; STAGING_DOWN stops its server at exit.
         env = self.staging_env(61500)
@@ -1591,6 +1760,7 @@ exit "$rc"
             ({"STAGING_UP": "true", "STAGING_SERVICES": "web 1api"}, "got '1api'"),
             ({"STAGING_UP": "true", "STAGING_PORT_BASE": "70000"}, "STAGING_PORT_BASE must be a port number"),
             ({"STAGING_UP": "true", "STAGING_READY_S": "soon"}, "STAGING_READY_S must be a number of seconds"),
+            ({"STAGING_UP": "true", "STAGING_KEEP": "yes"}, "STAGING_KEEP must be 0 or 1"),
             ({"STAGING_CHECK": "true"}, "STAGING_CHECK is set but STAGING_UP is empty"),
             ({"STAGING_UP": "true", "STAGING_CHECK_S": "later"}, "STAGING_CHECK_S must be a number of seconds"),
         ):

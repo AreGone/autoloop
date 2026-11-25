@@ -106,6 +106,35 @@ merge_base_branch() {
 }
 
 #######################################
+# Keep the milestone branch on top of the base branch: when the base branch moved by something the
+# loop did not merge itself (a push, a pull request merged by hand) it is merged in, so the runs,
+# the staging and the milestone's pull request always carry everything on it. Called between runs,
+# on every poll of a waiting pull request and while the loop waits for an answer. Uncommitted work
+# of a run postpones the merge to the next clean pass; a base branch that conflicts is told once
+# per commit of it and left to the owner. Without the remote there is nothing to follow.
+# Globals:
+#   base_left: the base branch commit that did not merge. base_waits: the one postponed.
+#######################################
+follow_base_branch() {
+  local base what
+  git remote get-url "${GIT_REMOTE}" >/dev/null 2>&1 || return 0
+  git fetch -q "${GIT_REMOTE}" "${BASE_BRANCH}" >> "${RUN_LOG}" 2>&1 || return 0
+  base="$(git rev-parse -q --verify "${GIT_REMOTE}/${BASE_BRANCH}^{commit}" 2>/dev/null)" || return 0
+  if git merge-base --is-ancestor "${base}" HEAD || [[ "${base}" == "${base_left:-}" ]]; then
+    return 0
+  fi
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    if [[ "${base}" != "${base_waits:-}" ]]; then
+      base_waits="${base}"
+      log "${BASE_BRANCH} moved to ${base:0:7}; merged in once the uncommitted changes are committed or reverted"
+    fi
+    return 0
+  fi
+  what="$(git log -1 --format=%s "${base}" | cut -c1-80)"
+  merge_base_branch "${what} (${base:0:7})" || base_left="${base}"
+}
+
+#######################################
 # The local stand-in for CI: runs LOCAL_GATE from the repository root, its output saved under log/.
 # Outputs:
 #   The log file.
@@ -131,8 +160,8 @@ run_local_gate() {
 # A pull request without any check is only waited on for the merge. When every failing check is a
 # job GitHub refused to start for billing, CI is not relied on: LOCAL_GATE runs once on that head,
 # green waits for the merge, red is reported as the check "local-gate" whose link is the gate's log.
-# Dependabot's pull requests are looked at on every poll; when a merge of the base branch moved
-# the head, the branch is pushed and its checks are watched from the start again. The staging
+# Dependabot's pull requests are looked at on every poll and the base branch is followed; when a
+# merge of the base branch moved the head, the branch is pushed and its checks are watched from the start again. The staging
 # follows the head too.
 # Globals:
 #   pr_failing: on a failed check, one line per failing check, "<bucket> <name> <link>".
@@ -153,6 +182,7 @@ wait_for_pr() {
     esac
     head="$(git rev-parse HEAD)"
     check_dependabot_prs
+    follow_base_branch
     if [[ "$(git rev-parse HEAD)" != "${head}" ]]; then
       # The base branch was merged in: the new head is judged afresh on the next pass.
       head="$(git rev-parse HEAD)"

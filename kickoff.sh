@@ -88,6 +88,7 @@ readonly STAGING_UP="${STAGING_UP:-}"
 readonly STAGING_CHECK="${STAGING_CHECK:-}"
 readonly STAGING_CHECK_S="${STAGING_CHECK_S:-900}"
 readonly STAGING_DOWN="${STAGING_DOWN:-}"
+readonly STAGING_KEEP="${STAGING_KEEP:-0}"
 readonly STAGING_SERVICES="${STAGING_SERVICES:-}"
 readonly STAGING_PORT_BASE="${STAGING_PORT_BASE:-42000}"
 readonly STAGING_HOST="${STAGING_HOST:-$(hostname 2>/dev/null || echo localhost)}"
@@ -343,6 +344,32 @@ judge_questions() {
 }
 
 #######################################
+# Wait for the owner's answers over Telegram, up to ANSWER_WAIT_S seconds, in slices of MERGE_POLL_S:
+# between two slices the base branch is merged in when it moved and the staging follows, so a loop
+# that waits days for an answer still shows what landed on the base branch.
+# Returns:
+#   qa.py wait's: 0 every question answered, 2 Telegram not configured, 3 no answer in time or no
+#   open question.
+#######################################
+wait_for_answers() {
+  local deadline left rc
+  deadline=$(( $(date +%s) + ANSWER_WAIT_S ))
+  while true; do
+    left=$(( deadline - $(date +%s) ))
+    (( left > 0 )) || left=0
+    (( left < MERGE_POLL_S )) || left="${MERGE_POLL_S}"
+    rc=0
+    python3 -I "${HERE}/qa.py" wait --timeout "${left}" | sed '/^timeout waiting for answers$/d' || rc=$?
+    (( rc == 3 )) || return "${rc}"
+    if (( $(date +%s) >= deadline )) || [[ -z "$(python3 -I "${HERE}/qa.py" list --ids)" ]]; then
+      return 3
+    fi
+    follow_base_branch
+    staging_sync
+  done
+}
+
+#######################################
 # Ensure the work happens on the autoloop branch of the current milestone.
 #######################################
 ensure_branch() {
@@ -399,6 +426,10 @@ check_settings() {
     echo "STAGING_PORT_BASE must be a port number, got '${STAGING_PORT_BASE}'" >&2
     exit 3
   fi
+  if [[ "${STAGING_KEEP}" != "0" && "${STAGING_KEEP}" != "1" ]]; then
+    echo "STAGING_KEEP must be 0 or 1, got '${STAGING_KEEP}'" >&2
+    exit 3
+  fi
   if [[ ! "${STAGING_READY_S}" =~ ^[0-9]+$ ]]; then
     echo "STAGING_READY_S must be a number of seconds, got '${STAGING_READY_S}'" >&2
     exit 3
@@ -432,6 +463,7 @@ main() {
   local stage head_before progress_before rc=0
   while (( iteration < MAX_ITERATIONS )); do
     (( dry_run )) || check_dependabot_prs
+    (( dry_run )) || follow_base_branch
     staging_sync
     stage="$(next_stage)"
     case "${stage}" in
@@ -455,7 +487,7 @@ main() {
         fi
         notify "autoloop: BLOCKED on $(progress_field MILESTONE). $(python3 -I "${HERE}/qa.py" list --ids | wc -w) question(s) for you in QUESTIONS.md; they follow. Reply \"Q<n> <answer>\" to each."
         python3 -I "${HERE}/qa.py" send || true
-        if python3 -I "${HERE}/qa.py" wait --timeout "${ANSWER_WAIT_S}" && [[ "$(progress_field STATUS)" == "RUNNING" ]]; then
+        if wait_for_answers && [[ "$(progress_field STATUS)" == "RUNNING" ]]; then
           log "questions answered over Telegram; resuming"
           notify "autoloop: answers recorded in DECISIONS.md, resuming $(progress_field MILESTONE)"
           continue
@@ -561,7 +593,7 @@ main() {
         sed -i.bak '1s/^STATUS: .*/STATUS: BLOCKED/' "${PROGRESS}" && rm -f "${PROGRESS}.bak"
         local next_q last_result reason
         next_q="$(next_question_id)"
-        last_result="$(ls -t "${LOG_DIR}"/*-"${stage}".json 2>/dev/null | head -1)"
+        last_result="$(ls -t "${LOG_DIR}"/*-"${stage}".json 2>/dev/null | sed -n 1p || true)"
         reason="$(run_reason "${last_result}")"
         printf '\n## Q%s (%s): no progress after %d %s runs; what should the loop do?\nContext: %d %s runs ended with no commit%s. Last result: %s\nThe last run said: %s\nProposed: read that file, fix the cause (a refused command, too few turns, a failing acceptance), answer with the instruction for the next run.\nAnswer:\n' \
           "${next_q}" "$(date -u +%F)" "${blocked_after}" "${stage}" "${blocked_after}" "${stage}" "${detail}" "${last_result:-none}" "${reason}" >> "${QUESTIONS}"
