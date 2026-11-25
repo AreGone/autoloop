@@ -106,18 +106,27 @@ merge_base_branch() {
 }
 
 #######################################
-# The checks of a commit without the cancelled ones another run replaced: a workflow with one
-# concurrency group per branch cancels the push run when the pull request's run of the same commit
-# starts, and that cancelled check says nothing about the code while its namesake runs or has
-# finished. A cancelled check with no namesake stays: somebody stopped it, and it is told.
+# The checks of a commit without the cancelled ones of a run another run replaced: a workflow with
+# one concurrency group per branch cancels the push run when the pull request's run of the same
+# commit starts, and those cancelled checks say nothing about the code. A cancelled check is left
+# out when a check of another run (the run id in its link) passed, failed or is pending; the jobs
+# of the replacing run that wait for an earlier job are not listed yet, so names are not compared.
+# Cancelled checks with no other run stay: somebody stopped the run, and it is told.
 # Arguments:
 #   The check lines from gh, "<bucket> <name> <link>".
 #######################################
 live_checks() {
   awk '
-    { name = $0; sub(/^[^ ]+ /, "", name); sub(/ [^ ]+$/, "", name); line[NR] = $0; bucket[NR] = $1; names[NR] = name
-      if ($1 != "cancel") live[name] = 1 }
-    END { for (i = 1; i <= NR; i++) if (!(bucket[i] == "cancel" && names[i] in live)) print line[i] }
+    { run = ""; if (match($NF, /runs\/[0-9]+/)) run = substr($NF, RSTART, RLENGTH)
+      line[NR] = $0; bucket[NR] = $1; runs[NR] = run
+      if ($1 == "pass" || $1 == "fail" || $1 == "pending") live[run] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        other = 0
+        for (r in live) if (r != runs[i]) other = 1
+        if (!(bucket[i] == "cancel" && other)) print line[i]
+      }
+    }
   ' <<< "$1"
 }
 
@@ -167,8 +176,8 @@ run_local_gate() {
 
 #######################################
 # Block until the branch's pull request is merged, closed, or a check fails on its head commit.
-# Checks are read with gh (buckets pass, fail, pending, skipping, cancel; a cancelled check whose
-# namesake of another run is not cancelled is left out, see live_checks) and only when the pull
+# Checks are read with gh (buckets pass, fail, pending, skipping, cancel; a cancelled check of a run
+# that another run replaced is left out, see live_checks) and only when the pull
 # request's head is the local HEAD, so a stale rollup from the previous push is never judged.
 # The head is read again on every pass: a commit pushed after the checks went green (a merge of
 # the base branch, a fix pushed by hand) is judged like the loop's own push. When the pull

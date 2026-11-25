@@ -952,8 +952,12 @@ exit "$rc"
     def test_cancelled_check_replaced_by_another_run_is_not_a_failure(self):
         # One concurrency group per branch: the push run is cancelled when the pull request's run starts.
         self.write_progress(DONE_HEADER + TASK + LOG)
-        cancelled = "cancel gate https://example.invalid/actions/runs/41/job/5\ncancel unit tests https://example.invalid/actions/runs/41/job/6"
-        running = "pending gate https://example.invalid/actions/runs/43/job/8\npass unit tests https://example.invalid/actions/runs/43/job/9"
+        # The replacing run lists only its first job while the others wait for it.
+        cancelled = (
+            "cancel gate https://example.invalid/actions/runs/41/job/5\n"
+            "cancel unit tests https://example.invalid/actions/runs/41/job/6"
+        )
+        running = "pending gate https://example.invalid/actions/runs/43/job/8"
         result = self.call("wait_for_pr", timeout=3, FAKE_BRANCH_CHECKS=f"{cancelled}\n{running}")
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertEqual(self.failing(), "")
