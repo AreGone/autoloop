@@ -155,6 +155,7 @@ check_dependabot_prs() {
     IFS='|' read -r number sha mergeable review draft url title <<< "${line}"
     [[ "${number}" =~ ^[0-9]+$ && "${draft}" != "true" ]] || continue
     checks="$(gh pr checks "${number}" --json name,bucket,link --jq '.[] | "\(.bucket) \(.name) \(.link)"' 2>/dev/null || true)"
+    checks="$(live_checks "${checks}")"
     failing="$(grep -E '^(fail|cancel) ' <<< "${checks}" || true)"
     if [[ -n "${failing}" ]]; then
       dependabot_red "${number}" "${sha}" "${title}" "${url}" "${failing}"

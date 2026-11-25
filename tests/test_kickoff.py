@@ -147,7 +147,9 @@ case "$*" in
   *"pr view"*"headRefOid"*) echo "${FAKE_HEAD:-$(git rev-parse HEAD)}" ;;
   *"pr view"*"url"*) echo "https://example.invalid/pr/1" ;;
   *"pr checks"*)
-    if [ -n "${FAKE_GREEN_AT:-}" ] && [ "$(git rev-parse HEAD)" = "$FAKE_GREEN_AT" ]; then
+    if [ -n "${FAKE_BRANCH_CHECKS:-}" ]; then
+      printf '%s\\n' "$FAKE_BRANCH_CHECKS"
+    elif [ -n "${FAKE_GREEN_AT:-}" ] && [ "$(git rev-parse HEAD)" = "$FAKE_GREEN_AT" ]; then
       echo "pass gate https://example.invalid/actions/runs/43/job/8"
       if [ -n "${FAKE_THEN_COMMIT:-}" ]; then git commit -q --allow-empty -m "pushed after green"; fi
     else
@@ -946,6 +948,24 @@ exit "$rc"
         result = self.call("wait_for_pr")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.failing(), "fail gate https://example.invalid/actions/runs/42/job/7")
+
+    def test_cancelled_check_replaced_by_another_run_is_not_a_failure(self):
+        # One concurrency group per branch: the push run is cancelled when the pull request's run starts.
+        self.write_progress(DONE_HEADER + TASK + LOG)
+        cancelled = "cancel gate https://example.invalid/actions/runs/41/job/5\ncancel unit tests https://example.invalid/actions/runs/41/job/6"
+        running = "pending gate https://example.invalid/actions/runs/43/job/8\npass unit tests https://example.invalid/actions/runs/43/job/9"
+        result = self.call("wait_for_pr", timeout=3, FAKE_BRANCH_CHECKS=f"{cancelled}\n{running}")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.failing(), "")
+        # The replacing run failed: only its check is reported.
+        failed = running.replace("pending gate", "fail gate")
+        result = self.call("wait_for_pr", FAKE_BRANCH_CHECKS=f"{cancelled}\n{failed}")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.failing(), "fail gate https://example.invalid/actions/runs/43/job/8")
+        # A cancelled check nothing replaced is still told.
+        result = self.call("wait_for_pr", FAKE_BRANCH_CHECKS=cancelled)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.failing(), cancelled)
 
     def test_billing_refusal_runs_the_local_gate_and_waits_for_the_merge_when_green(self):
         self.write_progress(DONE_HEADER + TASK + LOG)

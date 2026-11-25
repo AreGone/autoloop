@@ -106,6 +106,22 @@ merge_base_branch() {
 }
 
 #######################################
+# The checks of a commit without the cancelled ones another run replaced: a workflow with one
+# concurrency group per branch cancels the push run when the pull request's run of the same commit
+# starts, and that cancelled check says nothing about the code while its namesake runs or has
+# finished. A cancelled check with no namesake stays: somebody stopped it, and it is told.
+# Arguments:
+#   The check lines from gh, "<bucket> <name> <link>".
+#######################################
+live_checks() {
+  awk '
+    { name = $0; sub(/^[^ ]+ /, "", name); sub(/ [^ ]+$/, "", name); line[NR] = $0; bucket[NR] = $1; names[NR] = name
+      if ($1 != "cancel") live[name] = 1 }
+    END { for (i = 1; i <= NR; i++) if (!(bucket[i] == "cancel" && names[i] in live)) print line[i] }
+  ' <<< "$1"
+}
+
+#######################################
 # Keep the milestone branch on top of the base branch: when the base branch moved by something the
 # loop did not merge itself (a push, a pull request merged by hand) it is merged in, so the runs,
 # the staging and the milestone's pull request always carry everything on it. Called between runs,
@@ -151,7 +167,8 @@ run_local_gate() {
 
 #######################################
 # Block until the branch's pull request is merged, closed, or a check fails on its head commit.
-# Checks are read with gh (buckets pass, fail, pending, skipping, cancel) and only when the pull
+# Checks are read with gh (buckets pass, fail, pending, skipping, cancel; a cancelled check whose
+# namesake of another run is not cancelled is left out, see live_checks) and only when the pull
 # request's head is the local HEAD, so a stale rollup from the previous push is never judged.
 # The head is read again on every pass: a commit pushed after the checks went green (a merge of
 # the base branch, a fix pushed by hand) is judged like the loop's own push. When the pull
@@ -211,6 +228,7 @@ wait_for_pr() {
     if [[ "${pr_head}" == "${head}" ]]; then
       # gh exits 1 on a failing check and 8 on a pending one; the output is what matters here.
       checks="$(gh pr checks "${branch}" --json name,bucket,link --jq '.[] | "\(.bucket) \(.name) \(.link)"' 2>/dev/null || true)"
+      checks="$(live_checks "${checks}")"
     fi
     failing="$(grep -E '^(fail|cancel) ' <<< "${checks}" || true)"
     if [[ -n "${failing}" ]] && billing_refused "${failing}"; then

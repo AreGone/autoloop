@@ -334,7 +334,9 @@ the wrapper records them and resumes (answering in the files by hand still
 works, with a restart). Read the judge's answers in the hourly report or in
 `QUESTIONS.md` and overrule one by editing its `Answer:` line and the
 DECISIONS.md row. Review and merge each milestone's pull request on GitHub:
-the loop opens it when the milestone is done, watches its checks (a red
+the loop opens it when the milestone is done, watches its checks (a
+cancelled check that another run of the same commit replaced, as a workflow
+with one concurrency group per branch produces, is not counted; a red
 check means the milestone is not done: the loop reopens it with a fix task
 and pushes again; it never asks for a merge while CI is red) and waits for
 the merge, then starts the next milestone by itself; closing the pull
